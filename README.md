@@ -1,36 +1,57 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Cheque Printing System (CPS) - Zonal OCR
 
-## Getting Started
+This is a premium web implementation of the Cheque Printing System, featuring high-accuracy coordinate-based OCR for extracting critical bank details from cheques.
 
-First, run the development server:
+## 🚀 Features
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
-```
+- **Zonal OCR Extraction**: Uses precise (x0, top, x1, bottom) coordinates to capture:
+  - Payee Name (Stops before currency symbols)
+  - Numeric Amount (Auto-sanitized)
+  - **MICR Line**: Accurate Routing and Account number capture, ignoring special glyphs.
+  - Cheque Number & Bank Details.
+- **Premium UI**: Built with Next.js 15, Tailwind CSS v4, and Framer Motion for a state-of-the-art experience.
+- **Vercel Native**: Dual-stack architecture with a React frontend and Python backend API.
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## 🛠️ Project Structure
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+- `api/extract.py`: Python handler using `pdfplumber` for coordinate-based scanning.
+- `src/app/page.tsx`: Premium React frontend with animated upload and data tables.
+- `requirements.txt`: Python dependencies for the Vercel serverless environment.
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## 📦 Local Development
 
-## Learn More
+1. **Install JS dependencies:**
+   ```bash
+   npm install
+   ```
 
-To learn more about Next.js, take a look at the following resources:
+2. **(Optional) Install Python dependencies for testing extraction scripts:**
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+3. **Run the development server:**
+   ```bash
+   npm run dev
+   ```
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## ☁️ Deployment on Vercel
 
-## Deploy on Vercel
+1. **Push to GitHub**:
+   - Create a new repository on GitHub.
+   - Run the following commands in your terminal:
+     ```bash
+     git remote add origin <your-repo-url>
+     git branch -M main
+     git push -u origin main
+     ```
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+2. **Connect to Vercel**:
+   - Go to [Vercel](https://vercel.com/new).
+   - Select the repository you just pushed.
+   - Vercel will automatically detect the Next.js frontend and the Python API.
+   - **Click Deploy.**
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+## 🔍 How it Works
+
+Unlike standard OCR which scans text linearly, this system uses **Zonal Mapping**. We have calibrated the exact coordinates for fields based on common bank templates (like Stellar Bank), ensuring that the MICR line at the bottom is captured even when traditional text extraction fails.
