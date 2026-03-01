@@ -2,7 +2,7 @@
 
 A full-stack **Zonal OCR** web application that automatically extracts structured financial data from bank cheque PDFs. Upload one or more cheques, get structured JSON back instantly — no cloud Vision APIs, no machine learning.
 
-**Live Demo**: [cps.vercel.app](https://cps.vercel.app) *(replace with your actual Vercel URL)*
+**Live Demo**: [cps.vercel.app](https://cps-mu.vercel.app/)
 
 ---
 
