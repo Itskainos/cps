@@ -1,10 +1,10 @@
 import os
-import io
-import re
 import sys
 import json
+import re
 import pdfplumber
 
+# --- ZONAL OCR LOGIC ---
 ZONES = {
     "Cheque_No": (480, 5, 570, 30),
     "Date": (480, 30, 580, 50),
@@ -19,7 +19,6 @@ ZONES = {
 def extract_zonal_data(page):
     headers = ["Date", "Cheque_No", "Payee", "Amount", "Memo", "Bank", "Routing_No", "Account_No"]
     res = {h: "" for h in headers}
-    
     raw = {}
     for field, bbox in ZONES.items():
         try:
@@ -27,31 +26,24 @@ def extract_zonal_data(page):
             raw[field] = cropped.extract_text() or ""
         except:
             raw[field] = ""
-
-    # Cleaning logic
     res["Date"] = raw.get("Date", "").strip()
     res["Cheque_No"] = re.sub(r"[^0-9]", "", raw.get("Cheque_No", ""))
-    
     p = raw.get("Payee", "").split('$')[0].split('\n')[0].strip()
     res["Payee"] = p
-    
     amt_raw = raw.get("Amount", "")
     amt = re.sub(r'[^0-9.]', '', amt_raw)
     res["Amount"] = amt
-    
     res["Memo"] = raw.get("Memo", "").strip()
     res["Bank"] = raw.get("Bank", "").strip()
-    
     res["Routing_No"] = re.sub(r'[^0-9]', '', raw.get("Routing_No", ""))
     res["Account_No"] = re.sub(r'[^0-9]', '', raw.get("Account_No", ""))
-    
     return res
 
-# --- CLI MODE (LOCAL DEV) ---
-def cli_mode(file_path):
-    results = []
+# --- CLI MODE (For Local Dev via Node Bridge) ---
+def run_cli(pdf_path):
     try:
-        with pdfplumber.open(file_path) as pdf:
+        results = []
+        with pdfplumber.open(pdf_path) as pdf:
             for page in pdf.pages:
                 data = extract_zonal_data(page)
                 if any(data.values()):
@@ -61,23 +53,20 @@ def cli_mode(file_path):
         print(json.dumps({"error": str(e)}))
         sys.exit(1)
 
-# --- SERVER MODE (VERCEL/CLOUD) ---
-def start_server():
-    try:
-        from flask import Flask, request, jsonify
-        from flask_cors import CORS
-    except ImportError:
-        print("Flask not found. Server mode unavailable. Use CLI mode.")
-        sys.exit(1)
-
+# --- VERCEL SERVERLESS HANDLER ---
+# We define a function that Vercel's Python runtime can use
+try:
+    from flask import Flask, request, jsonify
+    from flask_cors import CORS
+    
     app = Flask(__name__)
     CORS(app)
 
+    @app.route('/', methods=['POST'])
     @app.route('/api/extract', methods=['POST'])
-    def extract():
+    def vercel_handler():
         if 'file' not in request.files:
             return jsonify({"error": "No file uploaded"}), 400
-            
         file = request.files['file']
         results = []
         try:
@@ -89,11 +78,17 @@ def start_server():
             return jsonify(results)
         except Exception as e:
             return jsonify({"error": str(e)}), 500
-            
-    app.run(port=5000)
+except ImportError:
+    # Flask not available locally, which is fine for CLI mode
+    app = None
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
-        cli_mode(sys.argv[1])
+        # If we have an argument, it's the file path from the Node bridge
+        run_cli(sys.argv[1])
+    elif app:
+        # If no arguments and Flask is available, start the server (Vercel/Manual)
+        app.run(port=5000)
     else:
-        start_server()
+        print("Missing argument or Flask not installed.")
+        sys.exit(1)
