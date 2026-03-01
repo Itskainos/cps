@@ -7,6 +7,11 @@ import os from "os";
 
 const execAsync = promisify(exec);
 
+
+export async function GET() {
+    return NextResponse.json({ status: "OCR API is active and ready for POST requests." });
+}
+
 export async function POST(req: NextRequest) {
     try {
         const formData = await req.formData();

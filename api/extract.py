@@ -4,11 +4,6 @@ import re
 import sys
 import json
 import pdfplumber
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-
-app = Flask(__name__)
-CORS(app)
 
 ZONES = {
     "Cheque_No": (480, 5, 570, 30),
@@ -52,27 +47,7 @@ def extract_zonal_data(page):
     
     return res
 
-@app.route('/api/extract', methods=['POST'])
-def extract():
-    if 'file' not in request.files:
-        return jsonify({"error": "No file uploaded"}), 400
-        
-    file = request.files['file']
-    if file.filename == '':
-        return jsonify({"error": "Empty filename"}), 400
-        
-    results = []
-    try:
-        with pdfplumber.open(file) as pdf:
-            for page in pdf.pages:
-                data = extract_zonal_data(page)
-                if any(data.values()):
-                    results.append(data)
-        return jsonify(results)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-# Standalone CLI mode (Called by Node.js bridge locally)
+# --- CLI MODE (LOCAL DEV) ---
 def cli_mode(file_path):
     results = []
     try:
@@ -86,10 +61,39 @@ def cli_mode(file_path):
         print(json.dumps({"error": str(e)}))
         sys.exit(1)
 
+# --- SERVER MODE (VERCEL/CLOUD) ---
+def start_server():
+    try:
+        from flask import Flask, request, jsonify
+        from flask_cors import CORS
+    except ImportError:
+        print("Flask not found. Server mode unavailable. Use CLI mode.")
+        sys.exit(1)
+
+    app = Flask(__name__)
+    CORS(app)
+
+    @app.route('/api/extract', methods=['POST'])
+    def extract():
+        if 'file' not in request.files:
+            return jsonify({"error": "No file uploaded"}), 400
+            
+        file = request.files['file']
+        results = []
+        try:
+            with pdfplumber.open(file) as pdf:
+                for page in pdf.pages:
+                    data = extract_zonal_data(page)
+                    if any(data.values()):
+                        results.append(data)
+            return jsonify(results)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+            
+    app.run(port=5000)
+
 if __name__ == "__main__":
-    # If a filename is passed as argument, use CLI mode
     if len(sys.argv) > 1:
         cli_mode(sys.argv[1])
     else:
-        # Otherwise start the Flask server
-        app.run(port=5000)
+        start_server()
