@@ -1,6 +1,7 @@
 import os
 import io
 import re
+import sys
 import json
 import pdfplumber
 from flask import Flask, request, jsonify
@@ -71,9 +72,24 @@ def extract():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# Vercel legacy runtime handler (optional but helpful)
-def handler(event, context):
-    return app(event, context)
+# Standalone CLI mode (Called by Node.js bridge locally)
+def cli_mode(file_path):
+    results = []
+    try:
+        with pdfplumber.open(file_path) as pdf:
+            for page in pdf.pages:
+                data = extract_zonal_data(page)
+                if any(data.values()):
+                    results.append(data)
+        print(json.dumps(results))
+    except Exception as e:
+        print(json.dumps({"error": str(e)}))
+        sys.exit(1)
 
 if __name__ == "__main__":
-    app.run(port=5000)
+    # If a filename is passed as argument, use CLI mode
+    if len(sys.argv) > 1:
+        cli_mode(sys.argv[1])
+    else:
+        # Otherwise start the Flask server
+        app.run(port=5000)
