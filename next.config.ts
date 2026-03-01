@@ -3,12 +3,12 @@ import type { NextConfig } from "next";
 const nextConfig: NextConfig = {
   reactCompiler: true,
   async rewrites() {
+    if (process.env.NODE_ENV !== "development") return [];
+
     return [
       {
         source: "/api/extract",
-        destination: process.env.NODE_ENV === "development"
-          ? "/api/extract-bridge"
-          : "/api/extract", // In production (Vercel), it's natively handled by api/extract.py
+        destination: "/api/extract-bridge",
       },
     ];
   },
