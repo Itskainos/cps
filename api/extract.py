@@ -1,38 +1,46 @@
-import sys
-import json
+import os
 import io
 import re
+import json
 import pdfplumber
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 
-# Defined Coordinates (Zonal OCR) based on Stellar Bank Template
+app = Flask(__name__)
+CORS(app)
+
 ZONES = {
     "Cheque_No": (480, 5, 570, 30),
     "Date": (480, 30, 580, 50),
-    "Payee": (18, 80, 500, 100),
-    "Amount": (530, 75, 605, 95),
+    "Payee": (18, 80, 500, 110),
+    "Amount": (530, 75, 605, 100),
     "Memo": (50, 135, 300, 160),
-    "Bank": (200, 15, 412, 40),
+    "Bank": (200, 15, 412, 45),
     "Routing_No": (250, 250, 345, 275),
     "Account_No": (345, 250, 450, 275),
 }
 
-def extract_zonal_data(page) -> dict:
+def extract_zonal_data(page):
     headers = ["Date", "Cheque_No", "Payee", "Amount", "Memo", "Bank", "Routing_No", "Account_No"]
     res = {h: "" for h in headers}
     
     raw = {}
     for field, bbox in ZONES.items():
-        cropped = page.crop(bbox)
-        raw[field] = cropped.extract_text() or ""
+        try:
+            cropped = page.crop(bbox)
+            raw[field] = cropped.extract_text() or ""
+        except:
+            raw[field] = ""
 
-    # Cleaning
+    # Cleaning logic
     res["Date"] = raw.get("Date", "").strip()
     res["Cheque_No"] = re.sub(r"[^0-9]", "", raw.get("Cheque_No", ""))
     
     p = raw.get("Payee", "").split('$')[0].split('\n')[0].strip()
     res["Payee"] = p
     
-    amt = raw.get("Amount", "").replace('$', '').replace('*', '').strip()
+    amt_raw = raw.get("Amount", "")
+    amt = re.sub(r'[^0-9.]', '', amt_raw)
     res["Amount"] = amt
     
     res["Memo"] = raw.get("Memo", "").strip()
@@ -43,21 +51,29 @@ def extract_zonal_data(page) -> dict:
     
     return res
 
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python extract.py <file_path>")
-        sys.exit(1)
+@app.route('/api/extract', methods=['POST'])
+def extract():
+    if 'file' not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
         
-    file_path = sys.argv[1]
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({"error": "Empty filename"}), 400
+        
     results = []
-    
     try:
-        with pdfplumber.open(file_path) as pdf:
+        with pdfplumber.open(file) as pdf:
             for page in pdf.pages:
                 data = extract_zonal_data(page)
                 if any(data.values()):
                     results.append(data)
-        print(json.dumps(results))
+        return jsonify(results)
     except Exception as e:
-        print(json.dumps({"error": str(e)}))
-        sys.exit(1)
+        return jsonify({"error": str(e)}), 500
+
+# Vercel legacy runtime handler (optional but helpful)
+def handler(event, context):
+    return app(event, context)
+
+if __name__ == "__main__":
+    app.run(port=5000)
