@@ -36,6 +36,18 @@ interface ChequeData {
   Bank: string;
   Routing_No: string;
   Account_No: string;
+  ai_enhanced?: boolean;
+  confidence?: Record<string, number>;
+}
+
+function ConfidenceDot({ score }: { score?: number }) {
+  if (score === undefined) return null;
+  const color = score >= 0.9 ? "bg-emerald-400" : score >= 0.7 ? "bg-amber-400" : "bg-red-400";
+  const label = score >= 0.9 ? "High" : score >= 0.7 ? "Medium" : "Low";
+  return (
+    <span title={`AI Confidence: ${label} (${Math.round(score * 100)}%)`}
+      className={`inline-block w-2 h-2 rounded-full ${color} ml-1 cursor-help`} />
+  );
 }
 
 export default function Home() {
@@ -300,7 +312,14 @@ export default function Home() {
                         <tr className="border-b border-border-custom bg-black/[0.02] dark:bg-white/[0.02]">
                           <th className="px-6 py-4 text-xs font-bold uppercase text-slate-500 dark:text-slate-400 tracking-wider">Cheque Details</th>
                           <th className="px-6 py-4 text-xs font-bold uppercase text-slate-500 dark:text-slate-400 tracking-wider">Recipient & Value</th>
-                          <th className="px-6 py-4 text-xs font-bold uppercase text-slate-500 dark:text-slate-400 tracking-wider">MICR Footer</th>
+                          <th className="px-6 py-4 text-xs font-bold uppercase text-slate-500 dark:text-slate-400 tracking-wider">
+                            MICR Footer
+                            {results.some(r => r.ai_enhanced) && (
+                              <span className="ml-2 inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-violet-500/10 text-violet-500 dark:text-violet-400 text-[9px] font-bold tracking-wide normal-case">
+                                ✦ AI
+                              </span>
+                            )}
+                          </th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-border-custom">
@@ -314,7 +333,14 @@ export default function Home() {
                           >
                             <td className="px-6 py-6 border-l-4 border-l-transparent group-hover:border-l-indigo-500 transition-all">
                               <div className="flex flex-col gap-1">
-                                <span className="text-sm font-bold text-foreground">#{row.Cheque_No}</span>
+                                <div className="flex items-center gap-2">
+                                  <span className="text-sm font-bold text-foreground">#{row.Cheque_No}</span>
+                                  {row.ai_enhanced && (
+                                    <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-full bg-violet-500/10 text-violet-500 dark:text-violet-400 text-[9px] font-bold tracking-wide">
+                                      ✦ AI
+                                    </span>
+                                  )}
+                                </div>
                                 <span className="text-xs text-slate-500">{row.Date} | {row.Bank}</span>
                                 {row.Memo && <span className="text-[10px] text-indigo-500 dark:text-indigo-400 font-semibold italic">M: {row.Memo}</span>}
                               </div>
@@ -333,13 +359,19 @@ export default function Home() {
                                 <div className="flex items-center gap-2">
                                   <div className="flex flex-col">
                                     <span className="text-[9px] text-slate-400 dark:text-slate-500 font-bold tracking-tighter uppercase">ROUTING</span>
-                                    <span className="text-xs font-mono text-slate-700 dark:text-slate-300">{row.Routing_No}</span>
+                                    <div className="flex items-center">
+                                      <span className="text-xs font-mono text-slate-700 dark:text-slate-300">{row.Routing_No}</span>
+                                      <ConfidenceDot score={row.confidence?.Routing_No} />
+                                    </div>
                                   </div>
                                 </div>
                                 <div className="flex items-center gap-2">
                                   <div className="flex flex-col">
                                     <span className="text-[9px] text-slate-400 dark:text-slate-500 font-bold tracking-tighter uppercase">ACCOUNT</span>
-                                    <span className="text-xs font-mono text-slate-700 dark:text-slate-300">{row.Account_No}</span>
+                                    <div className="flex items-center">
+                                      <span className="text-xs font-mono text-slate-700 dark:text-slate-300">{row.Account_No}</span>
+                                      <ConfidenceDot score={row.confidence?.Account_No} />
+                                    </div>
                                   </div>
                                 </div>
                               </div>
