@@ -8,6 +8,9 @@
     "start": "next start",
     "lint": "eslint"
   },
+  "engines": {
+    "node": ">=20.9.0"
+  },
   "dependencies": {
     "@types/canvas-confetti": "^1.9.0",
     "clsx": "^2.1.1",

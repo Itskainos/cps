@@ -3,6 +3,9 @@
   "build": {
     "builder": "NIXPACKS"
   },
+  "env": {
+    "NIXPACKS_NODE_VERSION": "20"
+  },
   "deploy": {
     "startCommand": "python -m uvicorn api.main:app --host 0.0.0.0 --port $PORT",
     "healthcheckPath": "/api/health",
