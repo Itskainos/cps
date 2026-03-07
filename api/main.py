@@ -70,16 +70,11 @@ async def startup_event():
         logger.info('"Database tables initialized/verified"')
     except Exception as e:
         logger.error(f'"Database connection failed: {str(e)}"')
-    
-    # Verify/Create Upload Dir
-    try:
-        os.makedirs(UPLOAD_DIR, exist_ok=True)
-        logger.info(f'"Upload directory ready: {UPLOAD_DIR}"')
-    except Exception as e:
-        logger.error(f'"Failed to create upload dir: {str(e)}"')
 
 from fastapi.staticfiles import StaticFiles
 UPLOAD_DIR = os.path.join(os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "public"), "uploads")
+# StaticFiles requires the directory to exist AT MOUNT TIME
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 app.mount("/api/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 # ── Health ─────────────────────────────────────────────────────────────────────
