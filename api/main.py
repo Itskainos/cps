@@ -27,7 +27,7 @@ from .security import get_current_user
 # ── Logging: structured stdout (works in any hosting env) ──────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format='{"time":"%(asctime)s","level":"%(levelname)s","msg":%(message)s}',
+    format='{"time":"%(asctime)s","level":"%(levelname)s","msg":"%(message)s"}',
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
 logger = logging.getLogger("quicktrack")
@@ -62,19 +62,27 @@ async def log_requests(request: Request, call_next):
             content={"detail": str(e), "traceback": traceback.format_exc().split("\n")[-3:]}
         )
 
+# ── APP STARTUP MARKER ────────────────────────────────────────────────────────
+logger.info('"--- QUICKTRACK BACKEND INITIALIZING ---"')
+
 @app.on_event("startup")
 async def startup_event():
-    logger.info('"Backend starting up..."')
-    # ── Database Initialization ─────────────────────────────────────────────────
-    # Create tables if they don't exist
-    try:
-        # We do this in a thread to keep the event loop free
-        import asyncio
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, lambda: Base.metadata.create_all(bind=engine))
-        logger.info('"Database tables initialized/verified"')
-    except Exception as e:
-        logger.error(f'"Database connection failed: {str(e)}"')
+    logger.info('"Booting startup event loop..."')
+    async def init_db_async():
+        try:
+            logger.info('"Starting background database initialization..."')
+            # Run the blocking create_all in a threadpool
+            import asyncio
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, lambda: Base.metadata.create_all(bind=engine))
+            logger.info('"Database tables initialized/verified in background"')
+        except Exception as e:
+            logger.error(f'"Background database initialization failed: {str(e)}"')
+
+    # FIRE AND FORGET - do NOT await this. 
+    # This allows the healthcheck to respond even if the DB is slow/cold starting.
+    import asyncio
+    asyncio.create_task(init_db_async())
 
 # ── Static Files ──────────────────────────────────────────────────────────────
 from fastapi.staticfiles import StaticFiles
