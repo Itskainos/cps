@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, UploadFile, File, HTTPException, Request
+from fastapi import FastAPI, Depends, UploadFile, File, HTTPException, Request, JSONResponse
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
@@ -35,6 +35,7 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",
         "https://cps-mu.vercel.app",   # production Vercel URL
+        "*",                           # Temporary wildcard for debug
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -49,9 +50,12 @@ async def log_requests(request: Request, call_next):
         logger.info(f'"Response {response.status_code} {request.url.path}"')
         return response
     except Exception as e:
-        logger.error(f'"Middleware error: {str(e)}"')
+        logger.error(f'"Middleware caught error: {str(e)}"')
         logger.error(traceback.format_exc())
-        raise e
+        return JSONResponse(
+            status_code=500,
+            content={"detail": str(e), "traceback": traceback.format_exc().split("\n")[-3:]}
+        )
 
 # ── Database Initialization ─────────────────────────────────────────────────────
 # Create tables if they don't exist (Runs on every startup)
@@ -70,7 +74,32 @@ app.mount("/api/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 # ── Health ─────────────────────────────────────────────────────────────────────
 @app.get("/api/health")
 async def health_check():
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+    return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
+
+@app.get("/api/debug/db")
+async def debug_db(db: Session = Depends(get_db)):
+    """Check if we can connect to the DB and see the tables."""
+    try:
+        # Check if tables exist
+        from sqlalchemy import inspect
+        inspector = inspect(engine)
+        tables = inspector.get_table_names()
+        
+        # Check if we can query
+        count = db.query(CheckBatch).count()
+        
+        return {
+            "status": "connected",
+            "tables": tables,
+            "batch_count": count,
+            "db_url_type": engine.url.drivername
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "traceback": traceback.format_exc().split("\n")[-5:]
+        }
 
 # ── Stats ──────────────────────────────────────────────────────────────────────
 @app.get("/api/checks/stats")
