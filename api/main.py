@@ -66,12 +66,19 @@ async def log_requests(request: Request, call_next):
         response = await call_next(request)
         logger.info(f'"RESPONSE: {response.status_code} {request.url.path}"')
         return response
+    except HTTPException as http_exc:
+        # Don't mask 401/404/etc as 500
+        logger.warning(f'"HTTP {http_exc.status_code}: {http_exc.detail} for {request.url.path}"')
+        return JSONResponse(
+            status_code=http_exc.status_code,
+            content={"detail": http_exc.detail}
+        )
     except Exception as e:
-        logger.error(f'"ERROR: {str(e)} for {request.url.path}"')
+        logger.error(f'"CRITICAL ERROR: {str(e)} for {request.url.path}"')
         logger.error(traceback.format_exc())
         return JSONResponse(
             status_code=500,
-            content={"detail": str(e), "traceback": traceback.format_exc().split("\n")[-3:]}
+            content={"detail": "Internal Server Error", "error": str(e)}
         )
 
 # ── APP STARTUP MARKER ────────────────────────────────────────────────────────
