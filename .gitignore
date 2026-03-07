@@ -44,3 +44,10 @@ __pycache__/
 *.csv
 *.pdf
 cheques/
+
+# Python backend runtime artifacts
+api/server.log
+*.db
+
+# Uploaded cheque scans (runtime files, not source)
+public/uploads/
