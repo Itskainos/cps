@@ -53,6 +53,14 @@ async def log_requests(request: Request, call_next):
         logger.error(traceback.format_exc())
         raise e
 
+# ── Database Initialization ─────────────────────────────────────────────────────
+# Create tables if they don't exist (Runs on every startup)
+try:
+    Base.metadata.create_all(bind=engine)
+    logger.info('"Database tables initialized/verified"')
+except Exception as e:
+    logger.error(f'"Database connection failed: {str(e)}"')
+
 from fastapi.staticfiles import StaticFiles
 
 UPLOAD_DIR = os.path.join(os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "public"), "uploads")
