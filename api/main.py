@@ -1,5 +1,5 @@
-from fastapi import FastAPI, Depends, UploadFile, File, HTTPException, Request, JSONResponse
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, Depends, UploadFile, File, HTTPException, Request
+from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from datetime import datetime, timezone, date
@@ -37,15 +37,18 @@ app = FastAPI(title="Quick Track Check System")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "https://cps-mu.vercel.app",   # production Vercel URL
-        "*",                           # Temporary wildcard for debug
-    ],
+    allow_origins=["*"], # Wildcard for easier debugging, will restrict later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── Health (Defined EARLY to ensure availability) ──────────────────────────────
+@app.get("/api/health")
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
+
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
@@ -88,22 +91,21 @@ async def startup_event():
 from fastapi.staticfiles import StaticFiles
 # Use absolute paths where possible
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-UPLOAD_ROOT = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", os.path.join(BASE_DIR, "public"))
+# Fallback logic for Railway Volumes
+UPLOAD_ROOT = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "public")
 UPLOAD_DIR = os.path.join(UPLOAD_ROOT, "uploads")
 
 try:
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    if not os.path.exists(UPLOAD_DIR):
+        os.makedirs(UPLOAD_DIR, exist_ok=True)
     logger.info(f'"Upload directory verified at: {UPLOAD_DIR}"')
 except Exception as e:
-    logger.error(f'"CRITICAL: Could not create upload dir {UPLOAD_DIR}: {str(e)}"')
-    # We continue so healthcheck can at least respond 500 with a log instead of crashing on boot
+    logger.error(f'"Volume mount failed, falling back to local: {str(e)}"')
+    UPLOAD_DIR = os.path.join(BASE_DIR, "public", "uploads")
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 app.mount("/api/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
-# ── Health ─────────────────────────────────────────────────────────────────────
-@app.get("/api/health")
-async def health_check():
-    return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 @app.get("/api/debug/db")
 async def debug_db(db: Session = Depends(get_db)):
