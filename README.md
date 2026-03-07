@@ -226,37 +226,29 @@ Content-Type: multipart/form-data
 
 ## ☁️ Deployment
 
-### Vercel (Recommended)
+## ☁️ Deployment
 
-The project uses a **hybrid multi-runtime** deployment on Vercel, declared in `vercel.json`:
+The project separates the Next.js frontend and the Python FastAPI backend for better performance and scalability.
 
-```json
-{
-  "builds": [
-    { "src": "package.json",    "use": "@vercel/next"   },
-    { "src": "api/extract.py",  "use": "@vercel/python" }
-  ],
-  "routes": [
-    { "src": "/api/extract", "dest": "/api/extract.py", "methods": ["POST", "OPTIONS"] },
-    { "src": "/(.*)",        "dest": "/$1" }
-  ]
-}
-```
+### 1. Backend (Railway)
+The backend does the heavy lifting (OCR) and requires Python and a PostgreSQL database.
+1. Create an account on [Railway.app](https://railway.app/).
+2. Click **New Project** -> Deploy from GitHub repo -> select `cps`.
+3. Add a **Neon PostgreSQL Database** (or provision one directly in Railway).
+4. Go to your Railway service **Variables** and add:
+   - `DATABASE_URL`: Your PostgreSQL connection string.
+   - `OPENAI_API_KEY`: (Optional) If you are using the OpenAI fallback extractor.
+5. Create a **Shared Volume** in Railway and mount it to `/data`.
+6. Add the variable `RAILWAY_VOLUME_MOUNT_PATH=/data`.
+   *(This ensures uploaded check images aren't deleted when the server restarts).*
 
-**Steps:**
-1. Push to GitHub
-2. Import the repository at [vercel.com/new](https://vercel.com/new)
-3. Keep all settings at their defaults
-4. Click **Deploy**
+### 2. Frontend (Vercel)
+1. Import the repository at [vercel.com/new](https://vercel.com/new)
+2. Go to Environment Variables and add:
+   - `NEXT_PUBLIC_API_URL`: The public domain Railway gave your backend (e.g., `https://cps-backend.up.railway.app`).
+3. Click **Deploy**.
 
-Vercel automatically installs Python dependencies from `requirements.txt`.
-
-### Local vs Production Routing
-
-| Environment | How `/api/extract` is served |
-|---|---|
-| **`npm run dev`** | Via `next.config.ts` rewrite → `src/app/api/extract-bridge/route.ts` → Python CLI subprocess |
-| **Vercel Production** | Via `vercel.json` → `api/extract.py` (Flask Python Serverless Function) |
+Next.js will automatically proxy all `/api/*` frontend calls directly to your Railway server.
 
 ---
 

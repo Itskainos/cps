@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useTheme } from "next-themes";
 import Link from "next/link";
@@ -16,7 +16,12 @@ import {
   Clock,
   Search,
   Plus,
-  Trash2
+  Trash2,
+  Activity,
+  CheckSquare,
+  ClipboardList,
+  ChevronLeft,
+  ChevronRight
 } from "lucide-react";
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
@@ -25,7 +30,6 @@ function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
-// Ensure matches Enum in FastAPI
 type CheckStatus = "PENDING" | "MANUAL_REVIEW" | "APPROVED" | "REJECTED";
 
 interface Batch {
@@ -38,32 +42,53 @@ interface Batch {
   approved_checks?: number;
 }
 
+interface Stats {
+  total_batches: number;
+  pending_checks: number;
+  review_checks: number;
+  approved_today: number;
+}
+
 export default function Dashboard() {
   const [batches, setBatches] = useState<Batch[]>([]);
+  const [stats, setStats] = useState<Stats | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const { theme, setTheme } = useTheme();
   const [mounted, setMounted] = useState(false);
+  
+  // Filtering & Pagination
+  const [searchQuery, setSearchQuery] = useState("");
+  const [currentPage, setCurrentPage] = useState(1);
+  const itemsPerPage = 8;
 
   useEffect(() => {
     setMounted(true);
-    fetchBatches();
+    fetchData();
   }, []);
 
-  const fetchBatches = async () => {
+  const fetchData = async () => {
     try {
-      const res = await fetch("/api/checks/batches", {
+      setLoading(true);
+      
+      // Fetch stats
+      const statsRes = await fetch("/api/checks/stats", {
+          headers: { "Authorization": "Bearer local-dev-token" }
+      });
+      if (statsRes.ok) {
+        setStats(await statsRes.json());
+      }
+
+      // Fetch batches (currently fetching all for client-side search, but backend supports pagination if we need server-side search later)
+      const res = await fetch("/api/checks/batches?skip=0&limit=1000", {
           headers: { "Authorization": "Bearer local-dev-token" }
       });
       if (!res.ok) throw new Error("Failed to load batches");
       const data = await res.json();
-      setBatches(data);
+      setBatches(data.batches || []);
     } catch (err: unknown) {
-      if (err instanceof Error) {
-          setError(err.message);
-      } else {
-          setError("Failed to load batches");
-      }
+      if (err instanceof Error) setError(err.message);
+      else setError("Failed to load batches");
     } finally {
       setLoading(false);
     }
@@ -78,10 +103,9 @@ export default function Dashboard() {
       });
       if (!res.ok) throw new Error("Failed to delete batch");
       setBatches(batches.filter(b => b.batch_id !== batchId));
+      fetchData(); // Refresh stats
     } catch (err: unknown) {
-      if (err instanceof Error) {
-        alert(err.message);
-      }
+      if (err instanceof Error) alert(err.message);
     }
   };
 
@@ -106,9 +130,7 @@ export default function Dashboard() {
       window.URL.revokeObjectURL(url);
       a.remove();
     } catch (err: unknown) {
-      if (err instanceof Error) {
-        alert("Export failed: " + err.message);
-      }
+      if (err instanceof Error) alert("Export failed: " + err.message);
     }
   };
 
@@ -121,13 +143,33 @@ export default function Dashboard() {
     }
   };
 
-  if (!mounted) {
-    return <div className="min-h-screen bg-background" />;
-  }
+  // Derived state for filtering and pagination
+  const filteredBatches = useMemo(() => {
+    if (!searchQuery) return batches;
+    const lowerQuery = searchQuery.toLowerCase();
+    return batches.filter(batch => 
+      batch.batch_number?.toString().includes(lowerQuery) ||
+      batch.created_by?.toLowerCase().includes(lowerQuery) ||
+      batch.status?.toLowerCase().includes(lowerQuery)
+    );
+  }, [batches, searchQuery]);
+
+  const totalPages = Math.ceil(filteredBatches.length / itemsPerPage);
+  
+  const currentBatches = useMemo(() => {
+    const start = (currentPage - 1) * itemsPerPage;
+    return filteredBatches.slice(start, start + itemsPerPage);
+  }, [filteredBatches, currentPage, itemsPerPage]);
+
+  // Reset page when search changes
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [searchQuery]);
+
+  if (!mounted) return <div className="min-h-screen bg-background" />;
 
   return (
     <main className="min-h-screen bg-background text-foreground selection:bg-indigo-500/30">
-      {/* Theme Toggle */}
       <div className="fixed top-8 right-8 z-50">
         <button
           onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
@@ -141,14 +183,12 @@ export default function Dashboard() {
         </button>
       </div>
 
-      {/* Background decoration */}
       <div className="fixed inset-0 overflow-hidden pointer-events-none">
         <div className="absolute top-[-10%] left-[-10%] w-[40%] h-[40%] bg-indigo-500/10 blur-[120px] rounded-full dark:opacity-100 opacity-40" />
         <div className="absolute bottom-[-10%] right-[-10%] w-[40%] h-[40%] bg-blue-500/10 blur-[120px] rounded-full dark:opacity-100 opacity-40" />
       </div>
 
       <div className="relative max-w-6xl mx-auto px-6 py-12 md:py-24 space-y-12">
-        {/* Header */}
         <header className="flex flex-col md:flex-row md:items-end justify-between gap-6">
           <div>
             <motion.div
@@ -192,8 +232,48 @@ export default function Dashboard() {
           </motion.div>
         </header>
 
-        {/* Stats / Overview (Optional) */}
-        
+        {/* Stats Row */}
+        <motion.div 
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ delay: 0.35 }}
+          className="grid grid-cols-1 md:grid-cols-3 gap-6"
+        >
+          <div className="bg-card border border-border-custom rounded-3xl p-6 flex flex-col shadow-lg backdrop-blur-md">
+            <div className="flex items-center gap-3 mb-4">
+              <div className="p-2.5 rounded-xl bg-indigo-500/10 text-indigo-500">
+                <ClipboardList className="w-5 h-5" />
+              </div>
+              <h3 className="font-semibold text-slate-500">Total Batches</h3>
+            </div>
+            <p className="text-4xl font-bold tracking-tight">{stats?.total_batches ?? "-"}</p>
+          </div>
+          
+          <div className="bg-card border border-border-custom rounded-3xl p-6 flex flex-col shadow-lg backdrop-blur-md">
+            <div className="flex items-center gap-3 mb-4">
+              <div className="p-2.5 rounded-xl bg-amber-500/10 text-amber-500">
+                <Activity className="w-5 h-5" />
+              </div>
+              <h3 className="font-semibold text-slate-500">Checks Pending Review</h3>
+            </div>
+            <p className="text-4xl font-bold tracking-tight text-amber-600 dark:text-amber-400">
+              {(stats?.review_checks ?? 0) + (stats?.pending_checks ?? 0) || "-"}
+            </p>
+          </div>
+
+          <div className="bg-card border border-border-custom rounded-3xl p-6 flex flex-col shadow-lg backdrop-blur-md">
+            <div className="flex items-center gap-3 mb-4">
+              <div className="p-2.5 rounded-xl bg-emerald-500/10 text-emerald-500">
+                <CheckSquare className="w-5 h-5" />
+              </div>
+              <h3 className="font-semibold text-slate-500">Approved Today</h3>
+            </div>
+            <p className="text-4xl font-bold tracking-tight text-emerald-600 dark:text-emerald-400">
+              {stats?.approved_today ?? "-"}
+            </p>
+          </div>
+        </motion.div>
+
         {/* Table Section */}
         <motion.div
            initial={{ opacity: 0, y: 40 }}
@@ -201,7 +281,7 @@ export default function Dashboard() {
            transition={{ delay: 0.4 }}
            className="bg-card border border-border-custom rounded-3xl overflow-hidden backdrop-blur-md shadow-2xl min-h-[400px] flex flex-col"
         >
-          <div className="p-6 border-b border-border-custom flex items-center justify-between bg-card/40">
+          <div className="p-6 border-b border-border-custom flex flex-col md:flex-row md:items-center justify-between bg-card/40 gap-4">
             <div className="flex items-center gap-3">
               <div className="p-2.5 rounded-xl bg-indigo-500/10 text-indigo-500">
                 <TableIcon className="w-5 h-5" />
@@ -210,13 +290,14 @@ export default function Dashboard() {
                 <h3 className="font-bold text-lg text-foreground tracking-tight">Recent Batches</h3>
               </div>
             </div>
-            {/* Search or Filter could go here */}
-            <div className="relative hidden md:block">
+            <div className="relative w-full md:w-auto">
               <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
               <input 
                 type="text" 
-                placeholder="Search batches..." 
-                className="pl-9 pr-4 py-2 bg-black/5 dark:bg-white/5 border border-border-custom rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/50 transition-all w-64 text-foreground"
+                placeholder="Search by ID, status, or creator..." 
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                className="pl-9 pr-4 py-2 bg-black/5 dark:bg-white/5 border border-border-custom rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/50 transition-all w-full md:w-72 text-foreground"
               />
             </div>
           </div>
@@ -232,7 +313,7 @@ export default function Dashboard() {
                    <AlertCircle className="w-5 h-5" />
                    <span>{error}</span>
                 </div>
-            ) : batches.length > 0 ? (
+            ) : currentBatches.length > 0 ? (
               <table className="w-full text-left border-collapse">
                 <thead>
                   <tr className="border-b border-border-custom bg-black/[0.02] dark:bg-white/[0.02]">
@@ -244,23 +325,23 @@ export default function Dashboard() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-border-custom">
-                  {batches.map((batch) => (
+                  {currentBatches.map((batch) => (
                     <tr
                       key={batch.batch_id}
                       className="group hover:bg-black/[0.01] dark:hover:bg-white/[0.02] transition-colors"
                     >
                       <td className="px-6 py-5">
                         <div className="flex items-center gap-3">
-                           <div className="w-10 h-10 rounded-xl bg-indigo-500/10 flex items-center justify-center text-indigo-600 dark:text-indigo-400 font-bold">
+                           <div className="w-10 h-10 rounded-xl bg-indigo-500/10 flex items-center justify-center text-indigo-600 dark:text-indigo-400 font-bold shrink-0">
                              #{batch.batch_number ?? batch.batch_id}
                            </div>
-                           <div className="flex flex-col">
-                              <span className="text-sm font-bold text-foreground">Upload Batch {batch.batch_number ?? batch.batch_id}</span>
-                              <span className="text-xs text-slate-500">by {batch.created_by}</span>
+                           <div className="flex flex-col min-w-0">
+                              <span className="text-sm font-bold text-foreground truncate">Upload Batch {batch.batch_number ?? batch.batch_id}</span>
+                              <span className="text-xs text-slate-500 truncate">by {batch.created_by}</span>
                            </div>
                         </div>
                       </td>
-                      <td className="px-6 py-5">
+                      <td className="px-6 py-5 whitespace-nowrap">
                         <span className={cn(
                           "inline-flex items-center px-2.5 py-1 rounded-full text-[10px] font-bold tracking-wide uppercase border",
                           getStatusColor(batch.status)
@@ -268,7 +349,7 @@ export default function Dashboard() {
                           {batch.status.replace("_", " ")}
                         </span>
                       </td>
-                      <td className="px-6 py-5">
+                      <td className="px-6 py-5 whitespace-nowrap">
                          <div className="flex items-center gap-1.5 text-sm text-slate-600 dark:text-slate-400">
                            <Clock className="w-4 h-4" />
                            <span>{batch.created_at ? new Date(batch.created_at).toLocaleDateString() : 'N/A'}</span>
@@ -294,7 +375,7 @@ export default function Dashboard() {
                            <span className="text-xs text-slate-500 italic">Processing...</span>
                          )}
                       </td>
-                      <td className="px-6 py-5 text-right">
+                      <td className="px-6 py-5 text-right whitespace-nowrap">
                         <div className="flex items-center justify-end gap-2 transition-opacity">
                           <button
                             title="Export to Excel"
@@ -302,7 +383,7 @@ export default function Dashboard() {
                             className="flex items-center gap-2 px-5 py-2.5 text-sm font-bold rounded-xl transition-all bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-500/20 border border-emerald-500/20"
                           >
                             <Download className="w-4 h-4" />
-                            <span>Export</span>
+                            <span className="hidden sm:inline">Export</span>
                           </button>
                           
                           <Link 
@@ -311,13 +392,13 @@ export default function Dashboard() {
                             title="Review Batch"
                           >
                             <Eye className="w-4 h-4" />
-                            <span>Review</span>
+                            <span className="hidden sm:inline">Review</span>
                           </Link>
                         
                           <button
                             title="Delete Batch"
                             onClick={() => deleteBatch(batch.batch_id)}
-                            className="flex items-center gap-2 p-2 text-sm font-medium rounded-xl transition-all bg-red-500/10 text-red-600 dark:text-red-400 hover:bg-red-500/20"
+                            className="flex items-center gap-2 p-2.5 text-sm font-medium rounded-xl transition-all bg-red-500/10 text-red-600 dark:text-red-400 hover:bg-red-500/20"
                           >
                             <Trash2 className="w-4 h-4" />
                           </button>
@@ -332,11 +413,36 @@ export default function Dashboard() {
                 <FileText className="w-12 h-12 mb-4 text-slate-400" />
                 <p className="text-lg text-foreground font-medium">No Batches Found</p>
                 <p className="text-sm text-slate-500 mt-1 max-w-sm">
-                  Upload new check PDFs to extract their data and start managing routing and account numbers securely.
+                  {searchQuery ? "Try adjusting your search query." : "Upload new check PDFs to extract their data and start managing routing and account numbers securely."}
                 </p>
               </div>
             )}
           </div>
+          
+          {/* Pagination Controls */}
+          {totalPages > 1 && (
+            <div className="p-4 border-t border-border-custom bg-black/[0.02] dark:bg-white/[0.02] flex items-center justify-between">
+              <span className="text-sm text-slate-500 font-medium ml-4">
+                Showing {((currentPage - 1) * itemsPerPage) + 1} to {Math.min(currentPage * itemsPerPage, filteredBatches.length)} of {filteredBatches.length}
+              </span>
+              <div className="flex gap-2">
+                <button 
+                  onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+                  disabled={currentPage === 1}
+                  className="p-2 rounded-lg hover:bg-black/5 dark:hover:bg-white/10 disabled:opacity-50 transition-colors"
+                >
+                  <ChevronLeft className="w-5 h-5" />
+                </button>
+                <button 
+                  onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
+                  disabled={currentPage === totalPages}
+                  className="p-2 rounded-lg hover:bg-black/5 dark:hover:bg-white/10 disabled:opacity-50 transition-colors"
+                >
+                  <ChevronRight className="w-5 h-5" />
+                </button>
+              </div>
+            </div>
+          )}
         </motion.div>
       </div>
     </main>
