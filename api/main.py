@@ -10,6 +10,11 @@ import csv
 import logging
 import traceback
 import os
+import re
+
+def get_safe_filename(filename: str) -> str:
+    """Sanitize filename to prevent directory traversal."""
+    return re.sub(r'[^a-zA-Z0-9._-]', '_', filename)
 
 # Local imports
 from .models import CheckBatch, Check, CheckStatus, Base
@@ -71,10 +76,20 @@ async def startup_event():
     except Exception as e:
         logger.error(f'"Database connection failed: {str(e)}"')
 
+# ── Static Files ──────────────────────────────────────────────────────────────
 from fastapi.staticfiles import StaticFiles
-UPLOAD_DIR = os.path.join(os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "public"), "uploads")
-# StaticFiles requires the directory to exist AT MOUNT TIME
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+# Use absolute paths where possible
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+UPLOAD_ROOT = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", os.path.join(BASE_DIR, "public"))
+UPLOAD_DIR = os.path.join(UPLOAD_ROOT, "uploads")
+
+try:
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    logger.info(f'"Upload directory verified at: {UPLOAD_DIR}"')
+except Exception as e:
+    logger.error(f'"CRITICAL: Could not create upload dir {UPLOAD_DIR}: {str(e)}"')
+    # We continue so healthcheck can at least respond 500 with a log instead of crashing on boot
+
 app.mount("/api/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 # ── Health ─────────────────────────────────────────────────────────────────────
@@ -180,14 +195,14 @@ async def extract_check_image(
     status_str, notes = validate_extracted_check_data(extracted_data)
 
     # Save locally (or to attached volume on Railway)
-    # This ensures uploads aren't lost when the Railway container restarts
-    file_path = os.path.join(UPLOAD_DIR, f"{batch_id}_{safe_filename}")
+    safe_name = get_safe_filename(file.filename)
+    file_path = os.path.join(UPLOAD_DIR, f"{batch_id}_{safe_name}")
     with open(file_path, "wb") as buffer:
         buffer.write(file_bytes)
 
     # Since the frontend doesn't host these files anymore in production, 
     # we point them to the backend's new static file route
-    s3_mock_url = f"/api/uploads/{batch_id}_{safe_filename}"
+    s3_mock_url = f"/api/uploads/{batch_id}_{safe_name}"
 
     # Date parse
     date_obj = None
