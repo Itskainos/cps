@@ -123,6 +123,16 @@ except Exception as e:
 app.mount("/api/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 
+@app.get("/api/public/debug-db")
+async def public_debug_db(db: Session = Depends(get_db)):
+    """Public version of debug check (no auth required)"""
+    try:
+        from sqlalchemy import text
+        db.execute(text("SELECT 1"))
+        return {"status": "Database Connection OK"}
+    except Exception as e:
+        return {"status": "Database Connection Failed", "error": str(e)}
+
 @app.get("/api/debug/db")
 async def debug_db(db: Session = Depends(get_db)):
     """Check if we can connect to the DB and see the tables."""
