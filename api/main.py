@@ -50,15 +50,24 @@ async def health_check():
     return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 
+@app.get("/")
+async def root():
+    return {
+        "message": "QuickTrack API is live",
+        "health": "/api/health",
+        "debug": "/api/debug/db",
+        "status": "ready"
+    }
+
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    logger.info(f'"Incoming {request.method} {request.url.path}"')
+    logger.info(f'"REQUEST: {request.method} {request.url.path}"')
     try:
         response = await call_next(request)
-        logger.info(f'"Response {response.status_code} {request.url.path}"')
+        logger.info(f'"RESPONSE: {response.status_code} {request.url.path}"')
         return response
     except Exception as e:
-        logger.error(f'"Middleware caught error: {str(e)}"')
+        logger.error(f'"ERROR: {str(e)} for {request.url.path}"')
         logger.error(traceback.format_exc())
         return JSONResponse(
             status_code=500,
