@@ -57,18 +57,29 @@ async def log_requests(request: Request, call_next):
             content={"detail": str(e), "traceback": traceback.format_exc().split("\n")[-3:]}
         )
 
-# ── Database Initialization ─────────────────────────────────────────────────────
-# Create tables if they don't exist (Runs on every startup)
-try:
-    Base.metadata.create_all(bind=engine)
-    logger.info('"Database tables initialized/verified"')
-except Exception as e:
-    logger.error(f'"Database connection failed: {str(e)}"')
+@app.on_event("startup")
+async def startup_event():
+    logger.info('"Backend starting up..."')
+    # ── Database Initialization ─────────────────────────────────────────────────
+    # Create tables if they don't exist
+    try:
+        # We do this in a thread to keep the event loop free
+        import asyncio
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, lambda: Base.metadata.create_all(bind=engine))
+        logger.info('"Database tables initialized/verified"')
+    except Exception as e:
+        logger.error(f'"Database connection failed: {str(e)}"')
+    
+    # Verify/Create Upload Dir
+    try:
+        os.makedirs(UPLOAD_DIR, exist_ok=True)
+        logger.info(f'"Upload directory ready: {UPLOAD_DIR}"')
+    except Exception as e:
+        logger.error(f'"Failed to create upload dir: {str(e)}"')
 
 from fastapi.staticfiles import StaticFiles
-
 UPLOAD_DIR = os.path.join(os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "public"), "uploads")
-os.makedirs(UPLOAD_DIR, exist_ok=True)
 app.mount("/api/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 # ── Health ─────────────────────────────────────────────────────────────────────
