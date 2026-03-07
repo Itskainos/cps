@@ -1,0 +1,10 @@
+package.json
+package-lock.json
+src/
+public/
+tsconfig.json
+next.config.ts
+next-env.d.ts
+.next/
+node_modules/
+# Keep requirements.txt and api/
