@@ -151,13 +151,21 @@ export default function Dashboard() {
     return "ADMIN";
   }, []);
 
+  const getAuthToken = useCallback(() => {
+    if (typeof document !== 'undefined') {
+      const match = document.cookie.match(new RegExp('(^| )auth_token=([^;]+)'));
+      if (match) return decodeURIComponent(match[2]);
+    }
+    return "";
+  }, []);
+
   const fetchData = useCallback(async (silent = false) => {
     try {
       if (silent) setRefreshing(true);
       else setLoading(true);
 
       const role = getAuthRole();
-      const headers = { Authorization: "Bearer local-dev-token", "X-User-Role": role };
+      const headers = { Authorization: `Bearer ${getAuthToken()}`, "X-User-Role": role };
 
       const [statsRes, batchRes] = await Promise.all([
         fetch("/api/checks/stats", { headers }),
@@ -193,7 +201,7 @@ export default function Dashboard() {
       const role = getAuthRole();
       const res = await fetch(`/api/checks/batch/${batchId}`, {
         method: "DELETE",
-        headers: { Authorization: "Bearer local-dev-token", "X-User-Role": role },
+        headers: { Authorization: `Bearer ${getAuthToken()}`, "X-User-Role": role },
       });
       if (!res.ok) throw new Error("Failed to delete batch");
       toast.success(`Batch #${batchNumber} deleted.`);

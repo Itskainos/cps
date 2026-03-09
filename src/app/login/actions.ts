@@ -7,7 +7,9 @@ export async function login(formData: FormData) {
   const username = formData.get('username') as string
   const password = formData.get('password') as string
 
-  const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+  const apiUrl = process.env.NEXT_PUBLIC_API_URL 
+    ? process.env.NEXT_PUBLIC_API_URL.replace(/\/$/, '') 
+    : 'http://127.0.0.1:8000'
   
   let success = false
   let data: any = null
@@ -33,7 +35,7 @@ export async function login(formData: FormData) {
 
   const cookieStore = await cookies()
   cookieStore.set('auth_token', data.access_token, {
-    httpOnly: true,
+    httpOnly: false,
     secure: process.env.NODE_ENV === 'production',
     sameSite: 'lax',
     maxAge: 60 * 60 * 24 * 7, // 1 week

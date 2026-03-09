@@ -131,7 +131,15 @@ export default function ReviewPage() {
       const match = document.cookie.match(new RegExp('(^| )auth_role=([^;]+)'));
       if (match) return decodeURIComponent(match[2]);
     }
-    return 'ADMIN';
+    return "ADMIN";
+  }, []);
+
+  const getAuthToken = useCallback(() => {
+    if (typeof document !== 'undefined') {
+      const match = document.cookie.match(new RegExp('(^| )auth_token=([^;]+)'));
+      if (match) return decodeURIComponent(match[2]);
+    }
+    return "";
   }, []);
 
   const fetchHistory = useCallback(async (checkId: number) => {
@@ -139,7 +147,7 @@ export default function ReviewPage() {
     try {
       const role = getAuthRole();
       const res = await fetch(`/api/checks/${checkId}/audit`, {
-        headers: { Authorization: "Bearer local-dev-token", "X-User-Role": role }
+        headers: { Authorization: `Bearer ${getAuthToken()}`, "X-User-Role": role }
       });
       if (res.ok) {
         const data = await res.json();
@@ -150,7 +158,7 @@ export default function ReviewPage() {
     } finally {
       setLoadingHistory(false);
     }
-  }, [getAuthRole]);
+  }, [getAuthRole, getAuthToken]);
 
   useEffect(() => {
     if (historyOpen && batch?.checks[currentIndex]) {
@@ -220,7 +228,7 @@ export default function ReviewPage() {
   const fetchBatchDetails = async () => {
     try {
       const res = await fetch(`/api/checks/batch/${apiId}`, {
-        headers: { Authorization: "Bearer local-dev-token" },
+        headers: { Authorization: `Bearer ${getAuthToken()}` },
       });
       if (!res.ok) throw new Error("Failed to load batch data");
       const data: BatchDetails = await res.json();
@@ -235,7 +243,7 @@ export default function ReviewPage() {
           highConfidenceChecks.map(check =>
             fetch(`/api/checks/${check.id}`, {
               method: "PATCH",
-              headers: { "Content-Type": "application/json", Authorization: "Bearer local-dev-token" },
+              headers: { "Content-Type": "application/json", Authorization: `Bearer ${getAuthToken()}` },
               body: JSON.stringify({ status: "APPROVED" }),
             })
           )
@@ -265,7 +273,7 @@ export default function ReviewPage() {
       const role = getAuthRole();
       const res = await fetch(`/api/checks/${currentCheck.id}`, {
         method: "PATCH",
-        headers: { "Content-Type": "application/json", Authorization: "Bearer local-dev-token", "X-User-Role": role },
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${getAuthToken()}`, "X-User-Role": role },
         body: JSON.stringify({
           status,
           store_name: form.store_name, check_number: form.check_number,

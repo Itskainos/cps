@@ -50,6 +50,14 @@ export default function AuditLogsPage() {
     return "ADMIN";
   }, []);
 
+  const getAuthToken = useCallback(() => {
+    if (typeof document !== "undefined") {
+      const match = document.cookie.match(new RegExp("(^| )auth_token=([^;]+)"));
+      if (match) return decodeURIComponent(match[2]);
+    }
+    return "";
+  }, []);
+
   const fetchLogs = useCallback(async () => {
     setLoading(true);
     try {
@@ -60,7 +68,7 @@ export default function AuditLogsPage() {
       }
 
       const res = await fetch("/api/audit?limit=100", {
-        headers: { Authorization: "Bearer local-dev-token", "X-User-Role": role },
+        headers: { Authorization: `Bearer ${getAuthToken()}`, "X-User-Role": role },
       });
 
       if (!res.ok) {
@@ -78,7 +86,7 @@ export default function AuditLogsPage() {
     } finally {
       setLoading(false);
     }
-  }, [getAuthRole, router, toast]);
+  }, [getAuthRole, getAuthToken, router, toast]);
 
   useEffect(() => {
     fetchLogs();

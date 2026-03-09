@@ -26,7 +26,7 @@ export function middleware(request: NextRequest) {
   if (pathname === '/login') {
     const token = request.cookies.get('auth_token');
     // Already authenticated → redirect home
-    if (token?.value === 'authenticated') {
+    if (token?.value) {
       return NextResponse.redirect(new URL('/', request.url));
     }
 
@@ -64,7 +64,7 @@ export function middleware(request: NextRequest) {
   const token = request.cookies.get('auth_token');
   const lastActive = request.cookies.get('last_active');
 
-  if (token?.value !== 'authenticated') {
+  if (!token?.value) {
     return NextResponse.redirect(new URL('/login', request.url));
   }
 
