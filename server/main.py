@@ -11,18 +11,32 @@ import logging
 import traceback
 import os
 import re
+import json
 
 def get_safe_filename(filename: str) -> str:
     """Sanitize filename to prevent directory traversal."""
     return re.sub(r'[^a-zA-Z0-9._-]', '_', filename)
 
 # Local imports
-from .models import CheckBatch, Check, CheckStatus, Base
-from .database import get_db, engine
+from .models import CheckBatch, Check, CheckStatus, Base, AuditLog, User
+from .database import get_db, engine, SessionLocal
 from .ai_extractor import extract_check_data_via_ai
 from .validators import validate_extracted_check_data
 from .export import generate_accounting_spreadsheet
-from .security import get_current_user
+from .security import get_current_user, get_password_hash, verify_password, create_access_token
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+class UserCreate(BaseModel):
+    username: str
+    password: str
+    role: str
+
+class UserUpdate(BaseModel):
+    password: Optional[str] = None
+    role: Optional[str] = None
 
 # ── Logging: structured stdout (works in any hosting env) ──────────────────────
 logging.basicConfig(
@@ -95,6 +109,14 @@ async def startup_event():
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, lambda: Base.metadata.create_all(bind=engine))
             logger.info('"Database tables initialized/verified in background"')
+
+            with SessionLocal() as db:
+                if db.query(User).count() == 0:
+                    pw_hash = get_password_hash("Quicktrackinc@2026!")
+                    admin_user = User(username="admin", password_hash=pw_hash, role="ADMIN")
+                    db.add(admin_user)
+                    db.commit()
+                    logger.info('"Default admin user created."')
         except Exception as e:
             logger.error(f'"Background database initialization failed: {str(e)}"')
 
@@ -364,6 +386,10 @@ async def get_batch_details(batch_id: int, user: dict = Depends(get_current_user
 @app.delete("/api/checks/batch/{batch_id}")
 async def delete_batch(batch_id: int, user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
     """Delete a batch and all its associated checks."""
+    if user.get("role") != "ADMIN":
+        logger.warning(f'"Unauthorized delete attempt by {user.get("username")} on batch {batch_id}"')
+        raise HTTPException(status_code=403, detail="Only Admins can delete batches")
+
     batch = db.query(CheckBatch).filter(CheckBatch.id == batch_id).first()
     if not batch:
         raise HTTPException(status_code=404, detail="Batch not found")
@@ -390,6 +416,19 @@ async def review_check(
     if update_data.status not in [e.value for e in CheckStatus]:
         raise HTTPException(status_code=400, detail="Invalid status")
 
+    old_values = {
+        "status": check.status.value,
+        "store_name": check.store_name,
+        "check_number": check.check_number,
+        "check_date": check.check_date.isoformat() if check.check_date else None,
+        "payee": check.payee,
+        "amount": check.amount,
+        "memo": check.memo,
+        "bank_name": check.bank,
+        "routing_number": check.routing_number,
+        "account_number": check.account_number,
+    }
+
     check.status = CheckStatus(update_data.status)
     check.reviewed_by = user["username"]
     check.reviewed_at = datetime.utcnow()
@@ -409,6 +448,34 @@ async def review_check(
         except ValueError:
             pass
 
+    new_values = {
+        "status": check.status.value,
+        "store_name": check.store_name,
+        "check_number": check.check_number,
+        "check_date": check.check_date.isoformat() if check.check_date else None,
+        "payee": check.payee,
+        "amount": check.amount,
+        "memo": check.memo,
+        "bank_name": check.bank,
+        "routing_number": check.routing_number,
+        "account_number": check.account_number,
+    }
+
+    changes = {}
+    for k, v in new_values.items():
+        if old_values[k] != v:
+            changes[k] = {"old": old_values[k], "new": v}
+
+    if changes:
+        action = "APPROVED" if changes.get("status", {}).get("new") == "APPROVED" else "UPDATED"
+        audit = AuditLog(
+            check_id=check.id,
+            user=user["username"],
+            action=action,
+            changes=json.dumps(changes)
+        )
+        db.add(audit)
+
     db.commit()
     db.refresh(check)
 
@@ -423,6 +490,46 @@ async def review_check(
             db.commit()
 
     return {"check_id": check.id, "status": check.status, "reviewed_by": check.reviewed_by}
+
+@app.get("/api/checks/{check_id}/audit")
+async def get_check_audit(check_id: int, user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Fetch history of changes for a specific check."""
+    logs = db.query(AuditLog).filter(AuditLog.check_id == check_id).order_by(AuditLog.created_at.desc()).all()
+    return {
+        "check_id": check_id,
+        "history": [
+            {
+                "id": log.id,
+                "user": log.user,
+                "action": log.action,
+                "changes": json.loads(log.changes) if log.changes else {},
+                "created_at": log.created_at.isoformat()
+            } for log in logs
+        ]
+    }
+
+@app.get("/api/audit")
+async def get_global_audit(skip: int = 0, limit: int = 50, user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Fetch global history of all changes across the system (Admins only)."""
+    if user.get("role") != "ADMIN":
+        raise HTTPException(status_code=403, detail="Only Admins can view the global audit log")
+
+    # Join with Check and CheckBatch to get more context
+    logs = db.query(AuditLog, Check).join(Check).order_by(AuditLog.created_at.desc()).offset(skip).limit(limit).all()
+    
+    return {
+        "logs": [
+            {
+                "id": log.AuditLog.id,
+                "check_id": log.AuditLog.check_id,
+                "batch_id": log.Check.batch_id,
+                "user": log.AuditLog.user,
+                "action": log.AuditLog.action,
+                "changes": json.loads(log.AuditLog.changes) if log.AuditLog.changes else {},
+                "created_at": log.AuditLog.created_at.isoformat()
+            } for log in logs
+        ]
+    }
 
 # ── Export ─────────────────────────────────────────────────────────────────────
 @app.get("/api/checks/export")
@@ -445,6 +552,8 @@ def download_batch_csv(batch_id: int, user: dict = Depends(get_current_user), db
     if not checks:
         raise HTTPException(status_code=404, detail="No checks found for this batch")
 
+    batch_number = db.query(CheckBatch).filter(CheckBatch.id <= batch_id).count()
+
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow([
@@ -454,7 +563,7 @@ def download_batch_csv(batch_id: int, user: dict = Depends(get_current_user), db
 
     for check in checks:
         writer.writerow([
-            check.batch_id, check.store_name, check.check_number,
+            batch_number, check.store_name, check.check_number,
             check.check_date.strftime("%Y-%m-%d") if check.check_date else None,
             check.payee, check.amount, check.memo, check.bank,
             check.status.value, check.reviewed_by,
@@ -467,3 +576,80 @@ def download_batch_csv(batch_id: int, user: dict = Depends(get_current_user), db
         media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename=QuickTrack_Batch_{batch_id}_Export.csv"}
     )
+
+# ── User Management & Auth ────────────────────────────────────────────────────────
+
+@app.post("/api/auth/login")
+async def login(req: LoginRequest, db: Session = Depends(get_db)):
+    """Verifies user credentials and returns a JWT."""
+    user = db.query(User).filter(User.username == req.username).first()
+    if not user or not verify_password(req.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    
+    token = create_access_token(data={"sub": user.username})
+    return {"access_token": token, "token_type": "bearer", "role": user.role}
+
+@app.get("/api/users")
+async def get_users(db: Session = Depends(get_db), current_user: dict = Depends(get_current_user)):
+    """Fetch all users (Admins only)."""
+    if current_user.get("role") != "ADMIN":
+        raise HTTPException(status_code=403, detail="Only Admins can view users.")
+    users = db.query(User).all()
+    return {"users": [{"id": u.id, "username": u.username, "role": u.role, "created_at": u.created_at.isoformat() if u.created_at else None} for u in users]}
+
+@app.post("/api/users")
+async def create_user(req: UserCreate, db: Session = Depends(get_db), current_user: dict = Depends(get_current_user)):
+    """Create a new user (Admins only)."""
+    if current_user.get("role") != "ADMIN":
+        raise HTTPException(status_code=403, detail="Only Admins can create users.")
+    if db.query(User).filter(User.username == req.username).first():
+        raise HTTPException(status_code=400, detail="Username already exists")
+    
+    new_user = User(
+        username=req.username,
+        password_hash=get_password_hash(req.password),
+        role=req.role.upper()
+    )
+    db.add(new_user)
+    db.commit()
+    return {"message": "User created successfully"}
+
+@app.put("/api/users/{user_id}")
+async def update_user(user_id: int, req: UserUpdate, db: Session = Depends(get_db), current_user: dict = Depends(get_current_user)):
+    """Update a user's role or password (Admins only)."""
+    if current_user.get("role") != "ADMIN":
+        raise HTTPException(status_code=403, detail="Only Admins can edit users.")
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+        
+    # Prevent the last Admin from being downgraded
+    if req.role and req.role.upper() != "ADMIN" and user.role == "ADMIN":
+        admin_count = db.query(User).filter(User.role == "ADMIN").count()
+        if admin_count <= 1:
+            raise HTTPException(status_code=400, detail="Cannot downgrade the last Admin.")
+    
+    if req.password:
+        user.password_hash = get_password_hash(req.password)
+    if req.role:
+        user.role = req.role.upper()
+        
+    db.commit()
+    return {"message": "User updated successfully"}
+
+@app.delete("/api/users/{user_id}")
+async def delete_user(user_id: int, db: Session = Depends(get_db), current_user: dict = Depends(get_current_user)):
+    """Delete a user (Admins only)."""
+    if current_user.get("role") != "ADMIN":
+        raise HTTPException(status_code=403, detail="Only Admins can delete users.")
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+        
+    if user.id == current_user["user_id"]:
+        raise HTTPException(status_code=400, detail="You cannot delete yourself.")
+        
+    db.delete(user)
+    db.commit()
+    return {"message": "User deleted successfully"}
+

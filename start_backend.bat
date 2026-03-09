@@ -8,7 +8,7 @@ echo ============================================
 echo.
 
 cd /d "%~dp0"
-python -m uvicorn api.main:app --host 127.0.0.1 --port 8000
+python -m uvicorn server.main:app --host 127.0.0.1 --port 8000
 
 echo.
 echo [ERROR] Backend server has stopped. Press any key to restart...

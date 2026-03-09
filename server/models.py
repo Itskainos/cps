@@ -53,3 +53,25 @@ class Check(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     
     batch = relationship("CheckBatch", back_populates="checks")
+    audit_logs = relationship("AuditLog", back_populates="check", cascade="all, delete-orphan")
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    check_id = Column(Integer, ForeignKey("checks.id", ondelete="CASCADE"), nullable=False)
+    user = Column(String, nullable=False)
+    action = Column(String, nullable=False) # e.g., "UPDATED", "APPROVED"
+    changes = Column(String, nullable=True) # JSON string of changes
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    check = relationship("Check", back_populates="audit_logs")
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String, unique=True, index=True, nullable=False)
+    password_hash = Column(String, nullable=False)
+    role = Column(String, default="REVIEWER", nullable=False) # "ADMIN" or "REVIEWER"
+    created_at = Column(DateTime, default=datetime.utcnow)
