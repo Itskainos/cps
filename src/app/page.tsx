@@ -172,6 +172,11 @@ export default function Dashboard() {
         fetch("/api/checks/batches?skip=0&limit=1000", { headers }),
       ]);
 
+      if (statsRes.status === 401 || batchRes.status === 401) {
+        await logout();
+        return;
+      }
+
       if (statsRes.ok) setStats(await statsRes.json());
       if (!batchRes.ok) throw new Error("Failed to load batches");
       const data = await batchRes.json();

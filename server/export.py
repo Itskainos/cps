@@ -10,20 +10,36 @@ def generate_accounting_spreadsheet(db: Session, batch_id: int) -> BytesIO:
     checks = db.query(Check).filter(Check.batch_id == batch_id).all()
     batch_number = db.query(CheckBatch).filter(CheckBatch.id <= batch_id).count()
     
+    import pytz
+    texas_tz = pytz.timezone('US/Central')
+
     data = []
     for check in checks:
+        formatted_amount = f"${check.amount:,.2f}" if check.amount is not None else "$0.00"
+        formatted_date = check.check_date.strftime("%Y-%m-%d") if check.check_date else "N/A"
+        
+        if check.reviewed_at:
+            # SQLAlchemy returns naive datetime objects (assumed UTC from DB)
+            utc_dt = check.reviewed_at.replace(tzinfo=pytz.UTC)
+            texas_dt = utc_dt.astimezone(texas_tz)
+            formatted_reviewed_at = texas_dt.strftime("%Y-%m-%d %I:%M:%S %p CT")
+        else:
+            formatted_reviewed_at = "N/A"
+
         data.append({
-            "Batch ID": batch_number,
-            "Store": check.store_name,
-            "Check Number": check.check_number,
-            "Date": check.check_date.strftime("%Y-%m-%d") if check.check_date else None,
-            "Payee": check.payee,
-            "Amount": check.amount,
-            "Memo": check.memo,
-            "Bank": check.bank,
+            "Batch Number": batch_number,
+            "Date": formatted_date,
+            "Store": check.store_name or "N/A",
+            "Payee": check.payee or "N/A",
+            "Amount": formatted_amount,
+            "Bank Name": check.bank or "N/A",
+            "Routing Number": check.routing_number or "N/A",
+            "Account Number": check.account_number or "N/A",
+            "Check Number": check.check_number or "N/A",
+            "Memo": check.memo or "N/A",
             "Status": check.status.value,
-            "Reviewed By": check.reviewed_by,
-            "Reviewed At": check.reviewed_at.strftime("%Y-%m-%d %H:%M:%S") if check.reviewed_at else None
+            "Reviewed By": check.reviewed_by or "Auto",
+            "Reviewed At": formatted_reviewed_at
         })
         
     df = pd.DataFrame(data)

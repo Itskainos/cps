@@ -82,7 +82,7 @@ export default function UsersPage() {
 
       if (!res.ok) {
         if (res.status === 403 || res.status === 401) {
-          router.push("/");
+          await logout();
           return;
         }
         throw new Error("Failed to load users");

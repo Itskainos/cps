@@ -252,15 +252,56 @@ async def extract_check_image(
     # Validation
     status_str, notes = validate_extracted_check_data(extracted_data)
 
-    # Save locally (or to attached volume on Railway)
     safe_name = get_safe_filename(file.filename)
-    file_path = os.path.join(UPLOAD_DIR, f"{batch_id}_{safe_name}")
-    with open(file_path, "wb") as buffer:
-        buffer.write(file_bytes)
+    object_name = f"{batch_id}_{safe_name}"
 
-    # Since the frontend doesn't host these files anymore in production, 
-    # we point them to the backend's new static file route
-    s3_mock_url = f"/api/uploads/{batch_id}_{safe_name}"
+    # S3 Upload Setup
+    AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
+    AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+    AWS_REGION = os.getenv("AWS_REGION")
+    S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
+
+    if AWS_ACCESS_KEY_ID and S3_BUCKET_NAME:
+        import boto3
+        from botocore.exceptions import ClientError
+        
+        try:
+            s3_client = boto3.client(
+                's3',
+                aws_access_key_id=AWS_ACCESS_KEY_ID,
+                aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+                region_name=AWS_REGION
+            )
+            
+            # Upload the file bytes to S3
+            s3_client.upload_fileobj(
+                io.BytesIO(file_bytes),
+                S3_BUCKET_NAME,
+                object_name,
+                ExtraArgs={'ContentType': file.content_type}
+            )
+            logger.info(f'"Successfully uploaded {object_name} to S3 bucket {S3_BUCKET_NAME}"')
+
+            # Generate a pre-signed URL (valid for 7 days - maximum allowed by AWS)
+            # The frontend will use this URL to display the image securely
+            s3_mock_url = s3_client.generate_presigned_url(
+                'get_object',
+                Params={'Bucket': S3_BUCKET_NAME, 'Key': object_name},
+                ExpiresIn=604800 # 7 days
+            )
+        except Exception as e:
+            logger.error(f'"Failed to upload to S3 or generate URL: {str(e)}"')
+            # Fallback to local if S3 fails
+            file_path = os.path.join(UPLOAD_DIR, object_name)
+            with open(file_path, "wb") as buffer:
+                buffer.write(file_bytes)
+            s3_mock_url = f"/api/uploads/{object_name}"
+    else:
+        # Save locally if S3 is not configured
+        file_path = os.path.join(UPLOAD_DIR, object_name)
+        with open(file_path, "wb") as buffer:
+            buffer.write(file_bytes)
+        s3_mock_url = f"/api/uploads/{object_name}"
 
     # Date parse
     date_obj = None
@@ -538,11 +579,12 @@ def download_batch_spreadsheet(batch_id: int, user: dict = Depends(get_current_u
     if not db.query(CheckBatch).filter(CheckBatch.id == batch_id).first():
         raise HTTPException(status_code=404, detail="Batch ID not found")
 
+    batch_number = db.query(CheckBatch).filter(CheckBatch.id <= batch_id).count()
     excel_stream = generate_accounting_spreadsheet(db, batch_id)
     return StreamingResponse(
         excel_stream,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f"attachment; filename=QuickTrack_Batch_{batch_id}_Export.xlsx"}
+        headers={"Content-Disposition": f"attachment; filename=QuickTrack_Batch_{batch_number}_Export.xlsx"}
     )
 
 @app.get("/api/checks/export/csv")
@@ -557,24 +599,37 @@ def download_batch_csv(batch_id: int, user: dict = Depends(get_current_user), db
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow([
-        "Batch ID", "Store", "Check Number", "Date", "Payee", "Amount",
-        "Memo", "Bank", "Status", "Reviewed By", "Reviewed At"
+        "Batch Number", "Date", "Store", "Payee", "Amount",
+        "Bank Name", "Routing Number", "Account Number", "Check Number", "Memo", "Status", "Reviewed By"
     ])
 
     for check in checks:
+        # Format the amount to accounting standard
+        formatted_amount = f"${check.amount:,.2f}" if check.amount is not None else "$0.00"
+        
+        # Format date cleanly
+        formatted_date = check.check_date.strftime("%Y-%m-%d") if check.check_date else "N/A"
+
         writer.writerow([
-            batch_number, check.store_name, check.check_number,
-            check.check_date.strftime("%Y-%m-%d") if check.check_date else None,
-            check.payee, check.amount, check.memo, check.bank,
-            check.status.value, check.reviewed_by,
-            check.reviewed_at.strftime("%Y-%m-%d %H:%M:%S") if check.reviewed_at else None
+            batch_number, 
+            formatted_date,
+            check.store_name or "N/A", 
+            check.payee or "N/A", 
+            formatted_amount,
+            check.bank or "N/A", 
+            check.routing_number or "N/A",
+            check.account_number or "N/A",
+            check.check_number or "N/A", 
+            check.memo or "N/A", 
+            check.status.value, 
+            check.reviewed_by or "Auto"
         ])
 
     output.seek(0)
     return StreamingResponse(
         iter([output.getvalue()]),
         media_type="text/csv",
-        headers={"Content-Disposition": f"attachment; filename=QuickTrack_Batch_{batch_id}_Export.csv"}
+        headers={"Content-Disposition": f"attachment; filename=QuickTrack_Batch_{batch_number}_Export.csv"}
     )
 
 # ── User Management & Auth ────────────────────────────────────────────────────────

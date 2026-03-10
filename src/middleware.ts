@@ -64,8 +64,12 @@ export function middleware(request: NextRequest) {
   const token = request.cookies.get('auth_token');
   const lastActive = request.cookies.get('last_active');
 
-  if (!token?.value) {
-    return NextResponse.redirect(new URL('/login', request.url));
+  if (!token?.value || token.value === 'authenticated') {
+    const response = NextResponse.redirect(new URL('/login', request.url));
+    response.cookies.delete('auth_token');
+    response.cookies.delete('auth_role');
+    response.cookies.delete('last_active');
+    return response;
   }
 
   // Session timeout check

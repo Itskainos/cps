@@ -230,6 +230,7 @@ export default function ReviewPage() {
       const res = await fetch(`/api/checks/batch/${apiId}`, {
         headers: { Authorization: `Bearer ${getAuthToken()}` },
       });
+      if (res.status === 401) { await logout(); return; }
       if (!res.ok) throw new Error("Failed to load batch data");
       const data: BatchDetails = await res.json();
 
@@ -340,9 +341,9 @@ export default function ReviewPage() {
     else toast.success(`All checks approved!`);
   };
 
-  const handleExportCSV = async () => {
+  const handleExportExcel = async () => {
     try {
-      const res = await fetch(`/api/checks/export/csv?batch_id=${batch?.batch_id}`, {
+      const res = await fetch(`/api/checks/export?batch_id=${batch?.batch_id}`, {
         headers: { Authorization: "Bearer local-dev-token" },
       });
       if (!res.ok) throw new Error("Failed to export batch");
@@ -350,10 +351,11 @@ export default function ReviewPage() {
       const url = window.URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `QuickTrack_Batch_${batch?.batch_id}_Export.csv`;
+      const displayNum = batch?.batch_number ?? batch?.batch_id;
+      a.download = `QuickTrack_Batch_${displayNum}_Export.xlsx`;
       document.body.appendChild(a); a.click();
       window.URL.revokeObjectURL(url); a.remove();
-      toast.success("CSV exported successfully.");
+      toast.success("Excel report exported successfully.");
     } catch (err: unknown) {
       toast.error(err instanceof Error ? "Export failed: " + err.message : "Export failed");
     }
@@ -502,10 +504,10 @@ export default function ReviewPage() {
                 <FileText className="w-4 h-4" /> Print Report
               </button>
               <button
-                onClick={handleExportCSV}
+                onClick={handleExportExcel}
                 className="flex items-center gap-2 px-5 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-bold rounded-xl transition-all shadow-lg shadow-emerald-500/20"
               >
-                <Download className="w-4 h-4" /> Download CSV
+                <Download className="w-4 h-4" /> Download Excel
               </button>
             </div>
           </div>

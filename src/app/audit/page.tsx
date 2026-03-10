@@ -71,6 +71,8 @@ export default function AuditLogsPage() {
         headers: { Authorization: `Bearer ${getAuthToken()}`, "X-User-Role": role },
       });
 
+      if (res.status === 401) { await logout(); return; }
+
       if (!res.ok) {
         if (res.status === 403) {
           router.push("/");
