@@ -12,6 +12,10 @@ import traceback
 import os
 import re
 import json
+from dotenv import load_dotenv
+
+# Load environment variables from .env.local
+load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env.local"))
 
 def get_safe_filename(filename: str) -> str:
     """Sanitize filename to prevent directory traversal."""
@@ -180,6 +184,17 @@ async def debug_db(db: Session = Depends(get_db)):
             "traceback": traceback.format_exc().split("\n")[-5:]
         }
 
+@app.get("/api/debug/s3")
+async def debug_s3():
+    """Check if S3 environment variables are loaded."""
+    return {
+        "AWS_ACCESS_KEY_ID": "Found" if os.getenv("AWS_ACCESS_KEY_ID") else "Missing",
+        "AWS_REGION": os.getenv("AWS_REGION"),
+        "S3_BUCKET_NAME": os.getenv("S3_BUCKET_NAME"),
+        "ENV_FILE_PATH": os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env.local"),
+        "ENV_FILE_EXISTS": os.path.exists(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env.local"))
+    }
+
 # ── Stats ──────────────────────────────────────────────────────────────────────
 @app.get("/api/checks/stats")
 async def get_stats(user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -261,10 +276,13 @@ async def extract_check_image(
     AWS_REGION = os.getenv("AWS_REGION")
     S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
 
+    logger.info(f'"Checking S3 credentials: ID={"Found" if AWS_ACCESS_KEY_ID else "Missing"} Bucket={"Found" if S3_BUCKET_NAME else "Missing"}"')
+
     if AWS_ACCESS_KEY_ID and S3_BUCKET_NAME:
         import boto3
         from botocore.exceptions import ClientError
         
+        logger.info(f'"Attempting S3 upload to {S3_BUCKET_NAME} in {AWS_REGION}..."')
         try:
             s3_client = boto3.client(
                 's3',
