@@ -11,7 +11,7 @@ import fitz # PyMuPDF
 client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY", "dummy-key-for-local-boot"))
 
 SYSTEM_PROMPT = """
-Your job is to extract data from business checks for 'Quick Track'.
+You are an expert Check OCR Assistant.Your job is to extract data from business checks for 'Quick Track'.
 
 ### EXTRACTION LOGIC FOR MICR LINE (Bottom of Check):
 1. ROUTING NUMBER (9 Digits): 
