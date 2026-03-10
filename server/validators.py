@@ -10,6 +10,17 @@ OFFICIAL_QUICK_TRACK_STORES = [
 
 FUZZY_MATCH_THRESHOLD = 80  
 
+def is_valid_routing(routing: str) -> bool:
+    """Validates US routing numbers using the mathematical checksum."""
+    if not routing or len(routing) != 9 or not routing.isdigit():
+        return False
+    
+    # Weights for ABA Routing Number Checksum
+    weights = [3, 7, 1, 3, 7, 1, 3, 7, 1]
+    total = sum(int(digit) * weight for digit, weight in zip(routing, weights))
+    
+    return total % 10 == 0
+
 def validate_extracted_check_data(data: Dict[str, Any]) -> Tuple[str, str]:
     """
     Validates check data against business rules.
@@ -20,6 +31,8 @@ def validate_extracted_check_data(data: Dict[str, Any]) -> Tuple[str, str]:
     routing = str(data.get("routing_number", "")).strip()
     if not re.fullmatch(r"^\d{9}$", routing):
         notes.append(f"Routing Number issue (Expected 9 digits, got '{routing}')")
+    elif not is_valid_routing(routing):
+        notes.append(f"Routing Number Checksum Failed (OCR misread likely for '{routing}')")
         
     account = str(data.get("account_number", "")).strip()
     if not re.fullmatch(r"^\d{10}$", account):
