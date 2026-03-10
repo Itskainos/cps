@@ -234,28 +234,6 @@ export default function ReviewPage() {
       if (!res.ok) throw new Error("Failed to load batch data");
       const data: BatchDetails = await res.json();
 
-      // Auto-approve high-confidence PENDING and MANUAL_REVIEW checks
-      const highConfidenceChecks = data.checks.filter(
-        c => (c.status === "PENDING" || c.status === "MANUAL_REVIEW") && (c.confidence_score ?? 0) >= AUTO_APPROVE_THRESHOLD
-      );
-
-      if (highConfidenceChecks.length > 0) {
-        await Promise.all(
-          highConfidenceChecks.map(check =>
-            fetch(`/api/checks/${check.id}`, {
-              method: "PATCH",
-              headers: { "Content-Type": "application/json", Authorization: `Bearer ${getAuthToken()}` },
-              body: JSON.stringify({ status: "APPROVED" }),
-            })
-          )
-        );
-        // Update local data to reflect auto-approvals
-        data.checks = data.checks.map(c =>
-          highConfidenceChecks.some(hc => hc.id === c.id) ? { ...c, status: "APPROVED" } : c
-        );
-        toast.success(`${highConfidenceChecks.length} check${highConfidenceChecks.length > 1 ? 's' : ''} auto-approved (≥90% confidence).`);
-      }
-
       setBatch(data);
       setLoading(false);
     } catch (err: unknown) {
@@ -682,7 +660,7 @@ export default function ReviewPage() {
               className="flex-1 w-full h-full flex items-center justify-center overflow-auto p-4 md:p-8"
               onWheel={e => { e.preventDefault(); changeZoom(e.deltaY < 0 ? 0.1 : -0.1); }}
             >
-              {currentCheck.s3_image_url.toLowerCase().endsWith(".pdf") ? (
+              {currentCheck.s3_image_url.toLowerCase().includes(".pdf") ? (
                 <iframe src={currentCheck.s3_image_url}
                   className="w-full h-full rounded-xl shadow-2xl border border-border-custom bg-white"
                   title="Check Scan PDF"
