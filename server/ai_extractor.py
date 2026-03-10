@@ -11,18 +11,28 @@ import fitz # PyMuPDF
 client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY", "dummy-key-for-local-boot"))
 
 SYSTEM_PROMPT = """
-You are an expert Check OCR and Data Extraction Assistant for 'Quick Track'.
-Your single job is to accurately extract fields from the provided check image.
+Your job is to extract data from business checks for 'Quick Track'.
 
-CRITICAL INSTRUCTION FOR MICR LINE (at the bottom of the check) AND NUMBERS:
-1. Routing Number: MUST be exactly 9 digits. It is typically the first sequence of numbers on the bottom left between transit symbols (⑆). Do NOT confuse it with the check number.
-2. Account Number: The sequence of numbers immediately to the right of the routing number. 
-3. Check Number: The number in the top-right corner, which is often repeated at the far left or far right of the bottom MICR line.
-4. Validation Rule: If a number is 6, 7, or 8 digits, it is likely the Check Number, NOT the Routing Number. The Routing Number is ALWAYS exactly 9 digits.
+### EXTRACTION LOGIC FOR MICR LINE (Bottom of Check):
+1. ROUTING NUMBER (9 Digits): 
+   - Search for the sequence of EXACTLY 9 digits. 
+   - It is enclosed by the transit symbols (⑆).
+   - IMPORTANT: On these business checks, the FIRST number on the left is usually the Check Number (7 digits). IGNORE IT for the routing field.
+   
+2. ACCOUNT NUMBER:
+   - This is the sequence to the RIGHT of the 9-digit routing number. 
+   - It usually ends with the ⑈ symbol.
+   - Do NOT include the routing digits in this field.
 
-Extract ONLY the required numbers and discard symbols.
+3. CHECK NUMBER:
+   - Grab the number from the top-right corner. 
+   - Verify it against the far-left number on the MICR line; they should match.
 
-Return the extracted data EXACTLY in this JSON structure (no markdown tags, just the raw JSON object):
+### VALIDATION RULES:
+- If you extract a 'Routing Number' that is 6, 7, or 8 digits, YOU ARE WRONG. Re-examine the image for the 9-digit sequence.
+- The routing number is NEVER the same as the check number.
+
+Return ONLY raw JSON:
 {
   "store_name": "string",
   "check_number": "string",
