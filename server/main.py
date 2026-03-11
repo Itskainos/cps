@@ -385,7 +385,7 @@ async def get_all_batches(
                 "batch_number": display_number,
                 "status": "APPROVED" if (total_checks > 0 and processed_checks == total_checks) else batch.status.value,
                 "created_by": batch.created_by,
-                "created_at": getattr(batch, "created_at", datetime.utcnow()).isoformat(),
+                "created_at": getattr(batch, "created_at", datetime.utcnow()).replace(tzinfo=timezone.utc).isoformat(),
                 "total_checks": total_checks,
                 "approved_checks": processed_checks,
             })
@@ -562,7 +562,7 @@ async def get_check_audit(check_id: int, user: dict = Depends(get_current_user),
                 "user": log.user,
                 "action": log.action,
                 "changes": json.loads(log.changes) if log.changes else {},
-                "created_at": log.created_at.isoformat()
+                "created_at": log.created_at.replace(tzinfo=timezone.utc).isoformat()
             } for log in logs
         ]
     }
@@ -585,7 +585,7 @@ async def get_global_audit(skip: int = 0, limit: int = 50, user: dict = Depends(
                 "user": log.AuditLog.user,
                 "action": log.AuditLog.action,
                 "changes": json.loads(log.AuditLog.changes) if log.AuditLog.changes else {},
-                "created_at": log.AuditLog.created_at.isoformat()
+                "created_at": log.AuditLog.created_at.replace(tzinfo=timezone.utc).isoformat()
             } for log in logs
         ]
     }
@@ -668,7 +668,7 @@ async def get_users(db: Session = Depends(get_db), current_user: dict = Depends(
     if current_user.get("role") != "ADMIN":
         raise HTTPException(status_code=403, detail="Only Admins can view users.")
     users = db.query(User).all()
-    return {"users": [{"id": u.id, "username": u.username, "role": u.role, "created_at": u.created_at.isoformat() if u.created_at else None} for u in users]}
+    return {"users": [{"id": u.id, "username": u.username, "role": u.role, "created_at": u.created_at.replace(tzinfo=timezone.utc).isoformat() if u.created_at else None} for u in users]}
 
 @app.post("/api/users")
 async def create_user(req: UserCreate, db: Session = Depends(get_db), current_user: dict = Depends(get_current_user)):
