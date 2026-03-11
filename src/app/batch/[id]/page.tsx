@@ -283,9 +283,11 @@ export default function ReviewPage() {
       setSaveSuccess(true);
       setTimeout(() => setSaveSuccess(false), 3000);
       
-      // If we are at the end of the filtered list, we just stay there (it'll disappear or transition).
-      // Otherwise, the *next* pending check gracefully falls into the current index slot automatically.
-      if (currentIndex > 0 && currentIndex === pendingChecks.length - 1) {
+      // If we are approving the very last pending check, route back to the Dashboard
+      if (pendingChecks.length === 1 && status === "APPROVED") {
+        toast.success("Batch completed! Returning to Dashboard...");
+        setTimeout(() => router.push("/"), 1500);
+      } else if (currentIndex > 0 && currentIndex === pendingChecks.length - 1) {
         setCurrentIndex(currentIndex - 1);
       }
     } catch (err: unknown) {
@@ -321,8 +323,12 @@ export default function ReviewPage() {
       } catch { failed++; }
     }
     setApprovingAll(false);
-    if (failed > 0) toast.error(`${failed} check(s) failed to approve.`);
-    else toast.success(`All checks approved!`);
+    if (failed > 0) {
+      toast.error(`${failed} check(s) failed to approve.`);
+    } else {
+      toast.success(`All checks approved! Returning to Dashboard...`);
+      setTimeout(() => router.push("/"), 1500);
+    }
   };
 
   const handleExportExcel = async () => {
