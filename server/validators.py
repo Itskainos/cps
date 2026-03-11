@@ -49,10 +49,18 @@ def validate_extracted_check_data(data: Dict[str, Any]) -> Tuple[str, str]:
     if best_match_score < FUZZY_MATCH_THRESHOLD:
         notes.append(f"Store name '{store_name}' failed fuzzy match (Highest Score: {best_match_score})")
         
-    confidence = data.get("confidence_score")
-    if confidence is not None and confidence < 0.8:
-        notes.append(f"Low AI Confidence Score: {confidence}")
+    # Check for forced MANUAL_REVIEW_REQUIRED from ai_extractor.py
+    if data.get("status") == "MANUAL_REVIEW_REQUIRED":
+        notes.append("Force Manual Review Required (Checksum or Extraction Failure)")
 
-    # PRD 3 requires validation failure logic -> MANUAL_REVIEW
-    # We now default to MANUAL_REVIEW for ALL extractions to ensure human-in-the-loop approval.
-    return "MANUAL_REVIEW", " | ".join(notes) if notes else "AI Extraction Complete - Awaiting Verification"
+    confidence = data.get("confidence_score")
+    if confidence is None or confidence < 0.80:
+        notes.append("Hard Block: Force a human to type the numbers manually.")
+    elif 0.80 <= confidence < 0.95:
+        notes.append("Warning: The data might be correct, but the image was a bit blurry.")
+        
+    # Return status depending on presence of validation notes
+    if notes:
+        return "MANUAL_REVIEW", " | ".join(notes)
+    
+    return "APPROVED", "AI Extraction Complete - Passed Validation"
