@@ -193,35 +193,37 @@ export default function ReviewPage() {
 
   useEffect(() => { fetchBatchDetails(); }, [id, apiId]);
 
+  const pendingChecks = batch?.checks.filter(c => showReviewAnyway || c.status === "PENDING" || c.status === "MANUAL_REVIEW") || [];
+  const currentCheck = pendingChecks[currentIndex];
+
   useEffect(() => {
-    if (batch?.checks && batch.checks.length > 0) {
-      const c = batch.checks[currentIndex];
+    if (currentCheck) {
       setEditForm({
-        store_name: c.store_name || "", check_number: c.check_number || "",
-        check_date: c.check_date || "", payee: c.payee || "",
-        amount: c.amount ? c.amount.toString() : "", memo: c.memo || "",
-        bank_name: c.bank_name || "", routing_number: c.routing_number || "",
-        account_number: c.account_number || "", status: c.status
+        store_name: currentCheck.store_name || "", check_number: currentCheck.check_number || "",
+        check_date: currentCheck.check_date || "", payee: currentCheck.payee || "",
+        amount: currentCheck.amount ? currentCheck.amount.toString() : "", memo: currentCheck.memo || "",
+        bank_name: currentCheck.bank_name || "", routing_number: currentCheck.routing_number || "",
+        account_number: currentCheck.account_number || "", status: currentCheck.status
       });
       setSaveSuccess(false);
     }
-  }, [currentIndex, batch]);
+  }, [currentIndex, currentCheck]);
 
   // Keyboard shortcuts
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement).tagName;
       if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
-      if (!batch) return;
+      if (pendingChecks.length === 0) return;
       if (e.key === "ArrowLeft") setCurrentIndex(i => Math.max(0, i - 1));
-      if (e.key === "ArrowRight") setCurrentIndex(i => Math.min(batch.checks.length - 1, i + 1));
+      if (e.key === "ArrowRight") setCurrentIndex(i => Math.min(pendingChecks.length - 1, i + 1));
       if (e.key === "a" || e.key === "A") handleSave("APPROVED");
       if (e.key === "r" || e.key === "R") handleSave("REJECTED");
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [batch, currentIndex, editForm]);
+  }, [pendingChecks, currentIndex, editForm]);
 
   const AUTO_APPROVE_THRESHOLD = 0.9; // 90% confidence
 
@@ -242,7 +244,6 @@ export default function ReviewPage() {
     }
   };
 
-  const currentCheck = batch?.checks[currentIndex];
 
   const handleSave = useCallback(async (status: CheckStatus, form = editForm) => {
     if (!currentCheck) return;
@@ -281,7 +282,12 @@ export default function ReviewPage() {
       });
       setSaveSuccess(true);
       setTimeout(() => setSaveSuccess(false), 3000);
-      if (currentIndex < batch!.checks.length - 1) setCurrentIndex(i => i + 1);
+      
+      // If we are at the end of the filtered list, we just stay there (it'll disappear or transition).
+      // Otherwise, the *next* pending check gracefully falls into the current index slot automatically.
+      if (currentIndex > 0 && currentIndex === pendingChecks.length - 1) {
+        setCurrentIndex(currentIndex - 1);
+      }
     } catch (err: unknown) {
       toast.error(err instanceof Error ? err.message : "Save failed");
     } finally {
@@ -586,7 +592,7 @@ export default function ReviewPage() {
                 </button>
               )}
             </div>
-            <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">{currentIndex + 1} of {batch.checks.length} Checks</span>
+            <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">{currentIndex + 1} of {pendingChecks.length} Checks</span>
           </div>
         </div>
 
@@ -622,7 +628,7 @@ export default function ReviewPage() {
             className="p-2 rounded-xl bg-black/5 dark:bg-white/5 hover:bg-black/10 dark:hover:bg-white/10 disabled:opacity-30 transition-colors">
             <ChevronLeft className="w-4 h-4" />
           </button>
-          <button onClick={() => setCurrentIndex(Math.min(batch.checks.length - 1, currentIndex + 1))} disabled={currentIndex === batch.checks.length - 1}
+          <button onClick={() => setCurrentIndex(Math.min(pendingChecks.length - 1, currentIndex + 1))} disabled={currentIndex >= pendingChecks.length - 1}
             className="p-2 rounded-xl bg-black/5 dark:bg-white/5 hover:bg-black/10 dark:hover:bg-white/10 disabled:opacity-30 transition-colors">
             <ChevronRight className="w-4 h-4" />
           </button>
