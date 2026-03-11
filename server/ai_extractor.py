@@ -65,7 +65,7 @@ async def extract_check_data_via_ai(file_bytes: bytes, filename: str) -> Dict[st
     if is_placeholder:
         # MOCK DATA RETURN for testing without credentials
         return {
-            "store_name": "Quick Track 119",
+            "store_name": "Quick Track Store 1", # Perfect fuzzy match for testing
             "check_number": "1190005",
             "check_date": "2026-02-16",
             "payee_name": "Aryan Poudel",
@@ -74,7 +74,7 @@ async def extract_check_data_via_ai(file_bytes: bytes, filename: str) -> Dict[st
             "bank_name": "Stellar Bank",
             "routing_number": "113025723",
             "account_number": "2017237191",
-            "confidence_score": 0.65  # Force a MANUAL_REVIEW for UI testing
+            "confidence_score": 0.98  # High confidence to test Auto-Approve
         }
 
     # 1. Provide PDF Support per PRD 3
