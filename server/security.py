@@ -44,7 +44,8 @@ def decrypt_data(token: str) -> str:
     try:
         return cipher_suite.decrypt(token.encode()).decode()
     except Exception:
-        return "Decryption Failed"
+        # Fallback for existing plaintext data
+        return token
 
 def get_current_user(credentials: HTTPAuthorizationCredentials = Security(security), db: Session = Depends(get_db)):
     """Verifies JWT token and retrieves user from database."""

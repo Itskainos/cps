@@ -39,8 +39,24 @@ class Check(Base):
     memo = Column(String)
     bank = Column(String) # Per PRD 3 rename
     
-    routing_number = Column(String, nullable=True)
-    account_number = Column(String, nullable=True)
+    _routing_number = Column("routing_number", String, nullable=True)
+    _account_number = Column("account_number", String, nullable=True)
+    
+    @property
+    def routing_number(self):
+        return decrypt_data(self._routing_number) if self._routing_number else None
+
+    @routing_number.setter
+    def routing_number(self, value):
+        self._routing_number = encrypt_data(value) if value else None
+
+    @property
+    def account_number(self):
+        return decrypt_data(self._account_number) if self._account_number else None
+
+    @account_number.setter
+    def account_number(self, value):
+        self._account_number = encrypt_data(value) if value else None
     
     confidence_score = Column(Float, nullable=True) # Per PRD 3
     
