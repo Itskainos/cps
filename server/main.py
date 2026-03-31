@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, UploadFile, File, HTTPException, Request
+from fastapi import FastAPI, Depends, UploadFile, File, HTTPException, Request, BackgroundTasks, Form
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
@@ -12,21 +12,31 @@ import traceback
 import os
 import re
 import json
+import base64
 from dotenv import load_dotenv
 
-# Load environment variables from .env.local
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format='{"time":"%(asctime)s","level":"%(levelname)s","msg":"%(message)s"}',
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+logger = logging.getLogger("quicktrack")
+
+# Load environment variables
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env.local"))
 
 def get_safe_filename(filename: str) -> str:
-    """Sanitize filename to prevent directory traversal."""
     return re.sub(r'[^a-zA-Z0-9._-]', '_', filename)
 
 # Local imports
+from .ai_extractor import extract_check_data_via_ai, extract_micr_with_tesseract, is_likely_deposit_slip
 from .models import CheckBatch, Check, CheckStatus, Base, AuditLog, User
 from .database import get_db, engine, SessionLocal
-from .ai_extractor import extract_check_data_via_ai
-from .validators import validate_extracted_check_data
+from .validators import validate_extracted_check_data, is_valid_routing, try_repair_routing
 from .export import generate_accounting_spreadsheet
+from .pdf_extractor import extract_checks_from_pdf, parse_range_string
+from .table_extractor import extract_table_data
 from .security import get_current_user, get_password_hash, verify_password, create_access_token
 
 class LoginRequest(BaseModel):
@@ -42,19 +52,11 @@ class UserUpdate(BaseModel):
     password: Optional[str] = None
     role: Optional[str] = None
 
-# ── Logging: structured stdout (works in any hosting env) ──────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format='{"time":"%(asctime)s","level":"%(levelname)s","msg":"%(message)s"}',
-    datefmt="%Y-%m-%dT%H:%M:%S",
-)
-logger = logging.getLogger("quicktrack")
-
 # ── App ────────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Quick Track Check System")
 
 app.add_middleware(
-    CORSMiddleware,
+    CORSMiddleware, # Heartbeat reload trigger
     allow_origins=["*"], # Wildcard for easier debugging, will restrict later
     allow_credentials=True,
     allow_methods=["*"],
@@ -79,7 +81,7 @@ async def root():
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    logger.info(f'"REQUEST: {request.method} {request.url.path}"')
+    logger.info(f'"REQUEST: {request.method} {request.url.path} from {request.client.host if request.client else "unknown"}"')
     try:
         response = await call_next(request)
         logger.info(f'"RESPONSE: {response.status_code} {request.url.path}"')
@@ -106,23 +108,33 @@ logger.info('"--- QUICKTRACK BACKEND INITIALIZING ---"')
 async def startup_event():
     logger.info('"Booting startup event loop..."')
     async def init_db_async():
-        try:
-            logger.info('"Starting background database initialization..."')
-            # Run the blocking create_all in a threadpool
-            import asyncio
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, lambda: Base.metadata.create_all(bind=engine))
-            logger.info('"Database tables initialized/verified in background"')
+        max_retries = 3
+        retry_delay = 2
+        for attempt in range(max_retries):
+            try:
+                logger.info(f'"Starting background database initialization (Attempt {attempt+1})..."')
+                # Run the blocking create_all in a threadpool
+                import asyncio
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, lambda: Base.metadata.create_all(bind=engine))
+                logger.info('"Database tables initialized/verified in background"')
 
-            with SessionLocal() as db:
-                if db.query(User).count() == 0:
-                    pw_hash = get_password_hash("Quicktrackinc@2026!")
-                    admin_user = User(username="admin", password_hash=pw_hash, role="ADMIN")
-                    db.add(admin_user)
-                    db.commit()
-                    logger.info('"Default admin user created."')
-        except Exception as e:
-            logger.error(f'"Background database initialization failed: {str(e)}"')
+                with SessionLocal() as db:
+                    if db.query(User).count() == 0:
+                        pw_hash = get_password_hash("Quicktrackinc@2026!")
+                        admin_user = User(username="admin", password_hash=pw_hash, role="ADMIN")
+                        db.add(admin_user)
+                        db.commit()
+                        logger.info('"Default admin user created."')
+                break # Success
+            except Exception as e:
+                logger.error(f'"Background database initialization failed: {str(e)}"')
+                if attempt < max_retries - 1:
+                    logger.info(f"Retrying in {retry_delay} seconds...")
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2
+                else:
+                    logger.error("Max retries reached. Database initialization failed.")
 
     # FIRE AND FORGET - do NOT await this. 
     # This allows the healthcheck to respond even if the DB is slow/cold starting.
@@ -230,59 +242,16 @@ class CheckApprovalUpdate(BaseModel):
     account_number: Optional[str] = None
 
 # ── Upload / Extract ───────────────────────────────────────────────────────────
-@app.post("/api/checks/upload")
-async def create_upload_batch(user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Creates a new CheckBatch wrapper to tie subsequent uploads to."""
-    new_batch = CheckBatch(
-        created_by=user["username"],
-        status=CheckStatus.PENDING
-    )
-    db.add(new_batch)
-    db.commit()
-    db.refresh(new_batch)
-    logger.info(f'"Batch created: id={new_batch.id} by={user["username"]}"')
-    return {"batch_id": new_batch.id, "status": new_batch.status}
 
-@app.post("/api/checks/extract")
-async def extract_check_image(
-    batch_id: int,
-    file: UploadFile = File(...),
-    user: dict = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """Uploads single check, performs OCR, and attaches to Batch ID."""
-    batch = db.query(CheckBatch).filter(CheckBatch.id == batch_id).first()
-    if not batch:
-        raise HTTPException(status_code=404, detail="Batch ID not found")
-
-    file_bytes = await file.read()
-
-    # AI Extraction
-    try:
-        extracted_data = await extract_check_data_via_ai(file_bytes, file.filename)
-    except Exception as e:
-        logger.error(f'"AI extraction failed for {file.filename}: {str(e)}"')
-        raise HTTPException(status_code=500, detail=f"AI parsing failed: {e}")
-
-    # Validation
-    status_str, notes = validate_extracted_check_data(extracted_data)
-
-    safe_name = get_safe_filename(file.filename)
-    object_name = f"{batch_id}_{safe_name}"
-
-    # S3 Upload Setup
+def _store_check_image(file_bytes: bytes, object_name: str, content_type: str = "image/jpeg") -> str:
+    """Upload check image to S3 or local storage. Returns the URL."""
     AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
     AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
     AWS_REGION = os.getenv("AWS_REGION")
     S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
 
-    logger.info(f'"Checking S3 credentials: ID={"Found" if AWS_ACCESS_KEY_ID else "Missing"} Bucket={"Found" if S3_BUCKET_NAME else "Missing"}"')
-
     if AWS_ACCESS_KEY_ID and S3_BUCKET_NAME:
         import boto3
-        from botocore.exceptions import ClientError
-        
-        logger.info(f'"Attempting S3 upload to {S3_BUCKET_NAME} in {AWS_REGION}..."')
         try:
             s3_client = boto3.client(
                 's3',
@@ -290,38 +259,91 @@ async def extract_check_image(
                 aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
                 region_name=AWS_REGION
             )
-            
-            # Upload the file bytes to S3
             s3_client.upload_fileobj(
                 io.BytesIO(file_bytes),
                 S3_BUCKET_NAME,
                 object_name,
-                ExtraArgs={'ContentType': file.content_type}
+                ExtraArgs={'ContentType': content_type}
             )
-            logger.info(f'"Successfully uploaded {object_name} to S3 bucket {S3_BUCKET_NAME}"')
-
-            # Generate a pre-signed URL (valid for 7 days - maximum allowed by AWS)
-            # The frontend will use this URL to display the image securely
-            s3_mock_url = s3_client.generate_presigned_url(
+            return s3_client.generate_presigned_url(
                 'get_object',
                 Params={'Bucket': S3_BUCKET_NAME, 'Key': object_name},
-                ExpiresIn=604800 # 7 days
+                ExpiresIn=604800
             )
         except Exception as e:
-            logger.error(f'"Failed to upload to S3 or generate URL: {str(e)}"')
-            # Fallback to local if S3 fails
-            file_path = os.path.join(UPLOAD_DIR, object_name)
-            with open(file_path, "wb") as buffer:
-                buffer.write(file_bytes)
-            s3_mock_url = f"/api/uploads/{object_name}"
-    else:
-        # Save locally if S3 is not configured
-        file_path = os.path.join(UPLOAD_DIR, object_name)
-        with open(file_path, "wb") as buffer:
-            buffer.write(file_bytes)
-        s3_mock_url = f"/api/uploads/{object_name}"
+            logger.error(f'"S3 upload failed, falling back to local: {str(e)}"')
 
-    # Date parse
+    # Local fallback
+    file_path = os.path.join(UPLOAD_DIR, object_name)
+    with open(file_path, "wb") as buffer:
+        buffer.write(file_bytes)
+    return f"/api/uploads/{object_name}"
+
+
+async def _process_single_check(
+    check_bytes: bytes, filename: str, batch_id: int, db: Session, table_data: dict = None
+) -> dict:
+    """Run AI extraction on a single check image and save to DB."""
+
+    # Pre-screen: Fast keyword scan to catch deposit slips before wasting AI API calls
+    if is_likely_deposit_slip(check_bytes):
+        logger.info(f"Pre-screen blocked deposit slip: {filename}")
+        return {"status": "SKIPPED", "filename": filename, "reason": "deposit_slip_prescreened"}
+
+    try:
+        extracted_data = await extract_check_data_via_ai(check_bytes, filename, table_data)
+    except Exception as e:
+        import traceback
+        error_trace = traceback.format_exc()
+        logger.error(f'"AI extraction failed for {filename}: {str(e)}\n{error_trace}"')
+        extracted_data = {
+            "store_name": None, "check_number": None, "check_date": None,
+            "payee_name": None, "amount": None, "memo": None,
+            "bank_name": None, "routing_number": None, "account_number": None,
+            "confidence_score": 0.0
+        }
+
+    # Guard: Skip completely empty records (AI crash, confidence 0, all key fields blank)
+    def _is_empty(v): return v is None or (isinstance(v, str) and v.strip() == "") or v == 0
+    key_fields = [extracted_data.get(k) for k in ["store_name", "payee_name", "amount", "check_number"]]
+    if all(_is_empty(f) for f in key_fields):
+        logger.info(f"Skipping empty record for {filename} — all key fields blank.")
+        return {"status": "SKIPPED", "filename": filename, "reason": "empty_record"}
+
+    status_str, notes = validate_extracted_check_data(extracted_data)
+
+    # ROUTING REPAIR PIPELINE
+    routing_raw = re.sub(r'\D', '', str(extracted_data.get("routing_number", "")))
+    if not is_valid_routing(routing_raw):
+        # Step 1: Fast math repair — compute the missing ABA check digit (works for 8-digit AI misreads)
+        repaired = try_repair_routing(routing_raw)
+        if repaired:
+            logger.info(f"Math repair SUCCESS for {filename}: '{routing_raw}' → '{repaired}'")
+            extracted_data['routing_number'] = repaired
+            extracted_data['routing_repair_method'] = 'check_digit_math'
+            status_str, notes = validate_extracted_check_data(extracted_data)
+        else:
+            # Step 2: Tesseract MICR fallback (heavier, slower, but works for completely wrong reads)
+            logger.info(f"Math repair failed for '{routing_raw}', triggering Tesseract MICR fallback...")
+            fallback_routing = extract_micr_with_tesseract(check_bytes)
+            if fallback_routing:
+                logger.info(f"Tesseract MICR fallback SUCCESS for {filename}: {fallback_routing}")
+                extracted_data['routing_number'] = fallback_routing
+                extracted_data['routing_repair_method'] = 'tesseract_micr'
+                status_str, notes = validate_extracted_check_data(extracted_data)
+            else:
+                logger.warning(f"All routing repair methods failed for {filename}. Keeping MANUAL_REVIEW.")
+
+    # Filter out non-check documents (like Deposit Slips)
+    doc_type = extracted_data.get("document_type", "check")
+    if doc_type != "check":
+        logger.info(f"Skipping non-check document: {filename} (Type: {doc_type}).")
+        return {"status": "SKIPPED", "filename": filename, "document_type": doc_type}
+
+    safe_name = get_safe_filename(filename)
+    object_name = f"{batch_id}_{safe_name}"
+    image_url = _store_check_image(check_bytes, object_name)
+
     date_obj = None
     try:
         if extracted_data.get("check_date"):
@@ -343,37 +365,219 @@ async def extract_check_image(
         confidence_score=extracted_data.get("confidence_score"),
         status=CheckStatus(status_str),
         validation_notes=notes,
-        s3_image_url=s3_mock_url
+        s3_image_url=image_url
     )
-
     db.add(new_check)
     db.commit()
     db.refresh(new_check)
 
-    logger.info(f'"Check extracted: id={new_check.id} batch={batch_id} status={status_str}"')
     return {
         "check_id": new_check.id,
-        "status": new_check.status,
-        "confidence_score": new_check.confidence_score,
-        "notes": new_check.validation_notes
+        "filename": filename,
+        "status": status_str,
+        "confidence_score": new_check.confidence_score
     }
+
+
+async def _process_batch_in_background(
+    check_images: list, batch_id: int, table_data: dict
+):
+    """
+    Background worker that processes checks using an asyncio.Semaphore to avoid OpenAI 429s.
+    """
+    import asyncio
+    
+    # Higher concurrency (5) and faster stagger (0.5s) for gpt-4o-mini
+    semaphore = asyncio.Semaphore(5)
+    
+    async def _sem_process(img_bytes, img_filename, index: int):
+        # Staggered start: wait 0.5 seconds per check in the queue
+        await asyncio.sleep(index * 0.5)
+        
+        async with semaphore:
+            # Create a fresh DB session per check to ensure thread-safety
+            # Add a small retry loop for the DB session in case of SSL/timeout issues
+            max_db_retries = 2
+            for db_attempt in range(max_db_retries):
+                try:
+                    with SessionLocal() as db:
+                        return await _process_single_check(img_bytes, img_filename, batch_id, db, table_data)
+                except Exception as db_err:
+                    if "SSL connection" in str(db_err) and db_attempt < max_db_retries -1:
+                        logger.warning(f"DB SSL Connection reset for {img_filename}, retrying...")
+                        await asyncio.sleep(1)
+                    else:
+                        logger.error(f"Fatal DB Error for {img_filename}: {str(db_err)}")
+                        raise
+
+    logger.info(f"Background processing started for {len(check_images)} checks on batch {batch_id} (Concurrency Limit=5, Staggered=0.5s)")
+    
+    tasks = [_sem_process(img_bytes, img_filename, i) for i, (img_bytes, img_filename) in enumerate(check_images)]
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+    logger.info(f"Background processing complete for batch {batch_id}")
+
+
+@app.post("/api/pdf/thumbnails")
+async def get_pdf_thumbnails(
+    file: UploadFile = File(...),
+    user: dict = Depends(get_current_user)
+):
+    """
+    Renders every page of a PDF as a low-res Base64 thumbnail for visual selection.
+    """
+    import fitz
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are accepted.")
+
+    try:
+        pdf_bytes = await file.read()
+        thumbnails = []
+        
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+            for page in doc:
+                # 0.25x scale for small thumbnails (approx. 150-200px wide)
+                pix = page.get_pixmap(matrix=fitz.Matrix(0.25, 0.25))
+                img_data = pix.tobytes("jpeg")
+                b64 = base64.b64encode(img_data).decode("utf-8")
+                thumbnails.append(b64)
+                
+        return {"thumbnails": thumbnails}
+    except Exception as e:
+        logger.error(f"Thumbnail generation failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate thumbnails: {str(e)}")
+
+
+@app.post("/api/checks/upload")
+@app.post("/api/checks/pdf_upload")  # backwards-compat alias
+async def upload_pdf_batch(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    table_pages: Optional[str] = Form(None),
+    check_pages: Optional[str] = Form(None),
+    force_scan: bool = Form(False),
+    user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Upload a bank statement PDF. Extracts all signed checks,
+    runs AI OCR on each in the background, and creates a batch.
+    """
+    import fitz
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are accepted.")
+
+    pdf_bytes = await file.read()
+    logger.info(f'"PDF upload received: {file.filename} ({len(pdf_bytes)} bytes) by {user["username"]}"')
+
+    # Get total page count for range validation
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+        max_pages = doc.page_count
+
+    # Parse ranges if provided
+    table_indices = parse_range_string(table_pages, max_pages) if table_pages else None
+    check_indices = parse_range_string(check_pages, max_pages) if check_pages else None
+
+    logger.info(f"Manual Ranges: tables={table_pages} (indices={table_indices}), checks={check_pages} (indices={check_indices}), Force={force_scan}")
+
+    # 1. Extract table data (Source of Truth)
+    try:
+        table_data = extract_table_data(pdf_bytes, page_indices=table_indices)
+        logger.info(f"Extracted {len(table_data)} summary table records for validation.")
+    except Exception as e:
+        logger.error(f"Table extraction failed (non-critical): {e}")
+        table_data = {}
+
+    # 2. Extract check images from the PDF
+    try:
+        check_images = extract_checks_from_pdf(pdf_bytes, page_indices=check_indices, force_scan=force_scan)
+    except Exception as e:
+        logger.error(f'"PDF extraction failed: {str(e)}"')
+        raise HTTPException(status_code=500, detail=f"Failed to extract checks from PDF: {e}")
+
+    if not check_images:
+        raise HTTPException(status_code=400, detail="No signed checks were found in this PDF.")
+
+    logger.info(f'"Extracted {len(check_images)} checks from PDF"')
+
+    # 3. Create batch (Commit immediately to fix foreign key integrity errors)
+    new_batch = CheckBatch(
+        created_by=user["username"],
+        status=CheckStatus.PENDING
+    )
+    db.add(new_batch)
+    db.commit()
+    db.refresh(new_batch)
+    batch_id = new_batch.id
+    logger.info(f'"Batch created: id={batch_id} by={user["username"]}"')
+
+    # 4. Start background processing
+    background_tasks.add_task(_process_batch_in_background, check_images, batch_id, table_data)
+
+    return {
+        "batch_id": batch_id,
+        "total_checks": len(check_images),
+        "status": "PROCESSING",
+        "message": "Check extraction started in background."
+    }
+
 
 # ── Batches ────────────────────────────────────────────────────────────────────
 @app.get("/api/checks/batches")
 async def get_all_batches(
     skip: int = 0,
     limit: int = 20,
+    status: Optional[str] = None,
+    created_by: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
     user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Retrieve batches for the Dashboard with pagination support."""
+    """Retrieve batches for the Dashboard with pagination support and filtering."""
     try:
-        # All batches ascending to compute sequential numbers, then paginate
-        all_batches = db.query(CheckBatch).order_by(CheckBatch.id.asc()).all()
-        total = len(all_batches)
+        query = db.query(CheckBatch)
+        
+        if status:
+            # Note: Dashboard "APPROVED" status is virtual (computed in the loop),
+            # but we can filter by the stored batch status too.
+            query = query.filter(CheckBatch.status == status)
+        if created_by:
+            query = query.filter(CheckBatch.created_by.ilike(f"%{created_by}%"))
+        
+        # All batches ascending to compute sequential numbers
+        all_query = db.query(CheckBatch).order_by(CheckBatch.id.asc())
+        all_batches_for_numbering = all_query.all()
+        
+        # Apply filters for the final result set
+        filtered_query = query.order_by(CheckBatch.id.desc())
+        
+        # Handle date filtering if provided
+        if start_date:
+            try:
+                # Expects YYYY-MM-DD
+                s_date = datetime.strptime(start_date, "%Y-%m-%d")
+                filtered_query = filtered_query.filter(CheckBatch.created_at >= s_date)
+            except ValueError:
+                pass
+        if end_date:
+            try:
+                # Expects YYYY-MM-DD
+                e_date = datetime.strptime(end_date, "%Y-%m-%d")
+                # Set to end of day
+                e_date = e_date.replace(hour=23, minute=59, second=59)
+                filtered_query = filtered_query.filter(CheckBatch.created_at <= e_date)
+            except ValueError:
+                pass
+
+        total = filtered_query.count()
+        paged_batches = filtered_query.offset(skip).limit(limit).all()
+
+        # Build numbering map
+        id_to_num = {b.id: i for i, b in enumerate(all_batches_for_numbering, start=1)}
 
         dashboard_data = []
-        for display_number, batch in enumerate(all_batches, start=1):
+        for batch in paged_batches:
             total_checks = db.query(Check).filter(Check.batch_id == batch.id).count()
             processed_checks = db.query(Check).filter(
                 Check.batch_id == batch.id,
@@ -382,23 +586,19 @@ async def get_all_batches(
 
             dashboard_data.append({
                 "batch_id": batch.id,
-                "batch_number": display_number,
+                "batch_number": id_to_num.get(batch.id, 0),
                 "status": "APPROVED" if (total_checks > 0 and processed_checks == total_checks) else batch.status.value,
                 "created_by": batch.created_by,
-                "created_at": getattr(batch, "created_at", datetime.utcnow()).replace(tzinfo=timezone.utc).isoformat(),
+                "created_at": batch.created_at.replace(tzinfo=timezone.utc).isoformat() if batch.created_at else None,
                 "total_checks": total_checks,
                 "approved_checks": processed_checks,
             })
-
-        # Newest first, then paginate
-        dashboard_data.reverse()
-        paginated = dashboard_data[skip: skip + limit]
 
         return {
             "total": total,
             "skip": skip,
             "limit": limit,
-            "batches": paginated,
+            "batches": dashboard_data,
         }
 
     except Exception as e:
@@ -458,6 +658,43 @@ async def delete_batch(batch_id: int, user: dict = Depends(get_current_user), db
     db.commit()
     logger.info(f'"Batch deleted: id={batch_id} by={user["username"]}"')
     return {"message": f"Batch {batch_id} successfully deleted"}
+
+@app.post("/api/checks/batch/{batch_id}/approve_all")
+async def approve_all_checks(batch_id: int, user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Bulk approve all checks in a batch."""
+    batch = db.query(CheckBatch).filter(CheckBatch.id == batch_id).first()
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    
+    checks = db.query(Check).filter(
+        Check.batch_id == batch_id,
+        Check.status.in_([CheckStatus.PENDING, CheckStatus.MANUAL_REVIEW, CheckStatus.EXTRACTED])
+    ).all()
+    
+    for check in checks:
+        check.status = CheckStatus.APPROVED
+        check.reviewed_by = user["username"]
+        check.reviewed_at = datetime.utcnow()
+        
+        # log in audit
+        audit = AuditLog(
+            check_id=check.id,
+            user=user["username"],
+            action="BULK_APPROVED",
+            changes=json.dumps({"status": {"old": "PRE_BULK", "new": "APPROVED"}})
+        )
+        db.add(audit)
+        
+    batch.status = CheckStatus.APPROVED
+    db.commit()
+    
+    return {"message": f"Successfully approved {len(checks)} checks in batch {batch_id}"}
+
+@app.get("/api/checks/batch/{batch_id}/json")
+async def get_batch_json(batch_id: int, user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Export batch as JSON."""
+    batch = await get_batch_details(batch_id, user, db)
+    return batch
 
 # ── Review ─────────────────────────────────────────────────────────────────────
 @app.patch("/api/checks/{check_id}")
@@ -634,18 +871,18 @@ def download_batch_csv(batch_id: int, user: dict = Depends(get_current_user), db
             check.store_name or "N/A", 
             check.payee or "N/A", 
             formatted_amount,
-            check.bank or "N/A", 
+            check.bank or "N/A",
             check.routing_number or "N/A",
             check.account_number or "N/A",
-            check.check_number or "N/A", 
-            check.memo or "N/A", 
-            check.status.value, 
+            check.check_number or "N/A",
+            check.memo or "N/A",
+            check.status.value,
             check.reviewed_by or "Auto"
         ])
 
     output.seek(0)
     return StreamingResponse(
-        iter([output.getvalue()]),
+        io.StringIO(output.getvalue()),
         media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename=QuickTrack_Batch_{batch_number}_Export.csv"}
     )

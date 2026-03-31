@@ -9,7 +9,12 @@ from sqlalchemy.orm import Session
 from .database import get_db
 
 # Generate with `Fernet.generate_key().decode()` and put in .env
-FERNET_KEY = os.getenv("FERNET_KEY", b"vYF9Qv2X6M-h2iVzYw6x4jQ-l8bA4yD-J0A6V9r8N-k=")
+_fernet_key_raw = os.getenv("FERNET_KEY", "vYF9Qv2X6M-h2iVzYw6x4jQ-l8bA4yD-J0A6V9r8N-k=")
+if isinstance(_fernet_key_raw, str):
+    FERNET_KEY = _fernet_key_raw.encode()
+else:
+    FERNET_KEY = _fernet_key_raw
+
 cipher_suite = Fernet(FERNET_KEY)
 
 SECRET_KEY = os.getenv("SECRET_KEY", "quicktrack-super-secret-key")

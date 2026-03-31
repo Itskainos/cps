@@ -130,19 +130,6 @@ export default function Dashboard() {
   const [currentPage, setCurrentPage] = useState(1);
   const itemsPerPage = 8;
 
-  useEffect(() => {
-    setMounted(true);
-    fetchData(false);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // Auto-refresh every 30 seconds
-  useEffect(() => {
-    const interval = setInterval(() => fetchData(true), 30000);
-    return () => clearInterval(interval);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
   const getAuthRole = useCallback(() => {
     if (typeof document !== 'undefined') {
       const match = document.cookie.match(new RegExp('(^| )auth_role=([^;]+)'));
@@ -167,9 +154,24 @@ export default function Dashboard() {
       const role = getAuthRole();
       const headers = { Authorization: `Bearer ${getAuthToken()}`, "X-User-Role": role };
 
+      // Build query string for filtering
+      const params = new URLSearchParams();
+      params.append("skip", "0");
+      params.append("limit", "1000"); // Standard high limit for dashboard
+      
+      if (statusFilter !== "ALL") params.append("status", statusFilter);
+      if (searchQuery.length > 2) params.append("created_by", searchQuery);
+      
+      if (dateFilter !== "ALL") {
+        const d = new Date();
+        if (dateFilter === "WEEK") d.setDate(d.getDate() - 7);
+        if (dateFilter === "MONTH") d.setMonth(d.getMonth() - 1);
+        params.append("start_date", d.toISOString().split('T')[0]);
+      }
+
       const [statsRes, batchRes] = await Promise.all([
         fetch("/api/checks/stats", { headers }),
-        fetch("/api/checks/batches?skip=0&limit=1000", { headers }),
+        fetch(`/api/checks/batches?${params.toString()}`, { headers }),
       ]);
 
       if (statsRes.status === 401 || batchRes.status === 401) {
@@ -187,8 +189,23 @@ export default function Dashboard() {
       if (silent) setRefreshing(false);
       else setLoading(false);
     }
+  }, [getAuthRole, getAuthToken, statusFilter, dateFilter, searchQuery, toast]);
+
+  useEffect(() => {
+    setMounted(true);
+    fetchData(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    fetchData(true);
+  }, [statusFilter, dateFilter, searchQuery, fetchData]);
+
+  // Auto-refresh every 30 seconds
+  useEffect(() => {
+    const interval = setInterval(() => fetchData(true), 30000);
+    return () => clearInterval(interval);
+  }, [fetchData]);
 
   const deleteBatch = async (batchId: number, batchNumber: number) => {
     const ok = await confirm({
@@ -304,12 +321,14 @@ export default function Dashboard() {
     <main className="min-h-screen bg-background text-foreground selection:bg-indigo-500/30">
       {/* Top-right controls */}
       <div className="fixed top-8 right-8 z-50 flex items-center gap-2">
-        {/* Auto-refresh indicator */}
-        {refreshing && (
-          <div className="p-3 rounded-2xl bg-card border border-border-custom shadow-xl">
-            <RefreshCw className="w-4 h-4 text-indigo-500 animate-spin" />
-          </div>
-        )}
+        <button
+          onClick={() => fetchData(true)}
+          disabled={refreshing}
+          className="p-3 rounded-2xl bg-card border border-border-custom shadow-xl hover:scale-110 transition-transform duration-300 group"
+          title="Refresh Data"
+        >
+          <RefreshCw className={cn("w-5 h-5 text-indigo-500", refreshing && "animate-spin")} />
+        </button>
         <button
           onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
           className="p-3 rounded-2xl bg-card border border-border-custom shadow-xl hover:scale-110 transition-transform duration-300 group"

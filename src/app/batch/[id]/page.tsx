@@ -32,6 +32,7 @@ import {
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
 import { useToast } from "../../components/Toast";
+import { useConfirm } from "../../components/ConfirmDialog";
 import { logout } from "../../login/actions";
 
 function cn(...inputs: ClassValue[]) {
@@ -100,6 +101,7 @@ export default function ReviewPage() {
   const router = useRouter();
   const { theme, setTheme } = useTheme();
   const toast = useToast();
+  const confirm = useConfirm();
 
   const [batch, setBatch] = useState<BatchDetails | null>(null);
   const [loading, setLoading] = useState(true);
@@ -109,6 +111,7 @@ export default function ReviewPage() {
   const [saving, setSaving] = useState(false);
   const [approvingAll, setApprovingAll] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
+  const [savedStatus, setSavedStatus] = useState<"APPROVED" | "REJECTED">("APPROVED");
   const [showReviewAnyway, setShowReviewAnyway] = useState(false);
 
   // Image zoom
@@ -191,7 +194,35 @@ export default function ReviewPage() {
     status: "APPROVED"
   });
 
-  useEffect(() => { fetchBatchDetails(); }, [id, apiId]);
+  const fetchBatch = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true);
+    try {
+      const role = getAuthRole();
+      const res = await fetch(`/api/checks/batch/${apiId}`, {
+        headers: { Authorization: `Bearer ${getAuthToken()}`, "X-User-Role": role }
+      });
+      if (res.status === 401) { await logout(); return; }
+      if (!res.ok) throw new Error("Failed to fetch batch data");
+      const data = await res.json();
+      setBatch(data);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "Connection failed";
+      setError(msg);
+      // Explicit connection error check
+      if (msg.includes("fetch")) {
+        toast.error("Backend server unreachable. Please check if the service is running.");
+      } else {
+        toast.error(msg);
+      }
+    } finally {
+      if (!silent) setLoading(false);
+    }
+  }, [apiId, getAuthRole, getAuthToken, toast]);
+
+  useEffect(() => {
+    fetchBatch();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [apiId]);
 
   const pendingChecks = batch?.checks.filter(c => showReviewAnyway || c.status === "PENDING" || c.status === "MANUAL_REVIEW") || [];
   const currentCheck = pendingChecks[currentIndex];
@@ -226,23 +257,6 @@ export default function ReviewPage() {
   }, [pendingChecks, currentIndex, editForm]);
 
   const AUTO_APPROVE_THRESHOLD = 0.9; // 90% confidence
-
-  const fetchBatchDetails = async () => {
-    try {
-      const res = await fetch(`/api/checks/batch/${apiId}`, {
-        headers: { Authorization: `Bearer ${getAuthToken()}` },
-      });
-      if (res.status === 401) { await logout(); return; }
-      if (!res.ok) throw new Error("Failed to load batch data");
-      const data: BatchDetails = await res.json();
-
-      setBatch(data);
-      setLoading(false);
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Failed to load batch data");
-      setLoading(false);
-    }
-  };
 
 
   const handleSave = useCallback(async (status: CheckStatus, form = editForm) => {
@@ -281,6 +295,7 @@ export default function ReviewPage() {
         return { ...prev, checks: newChecks };
       });
       setSaveSuccess(true);
+      setSavedStatus(status as "APPROVED" | "REJECTED");
       setTimeout(() => setSaveSuccess(false), 3000);
       
       // If we are approving the very last pending check, route back to the Dashboard
@@ -303,31 +318,32 @@ export default function ReviewPage() {
     const pending = batch.checks.filter(c => c.status !== "APPROVED" && c.status !== "REJECTED");
     if (pending.length === 0) { toast.info("All checks are already processed."); return; }
 
-    const ok = window.confirm(`Approve all ${pending.length} remaining unprocessed check(s)?`);
+    const ok = await confirm({
+      title: 'Bulk Approve Batch',
+      message: `Are you sure you want to approve all ${pending.length} remaining unprocessed check(s)? This will set their status to Approved instantly.`,
+      confirmLabel: 'Approve All',
+      cancelLabel: 'Cancel',
+      variant: 'warning',
+    });
     if (!ok) return;
 
     setApprovingAll(true);
-    let failed = 0;
-    for (const check of pending) {
-      try {
-        const res = await fetch(`/api/checks/${check.id}`, {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json", Authorization: "Bearer local-dev-token" },
-          body: JSON.stringify({ status: "APPROVED" }),
-        });
-        if (!res.ok) { failed++; continue; }
-        setBatch(prev => {
-          if (!prev) return prev;
-          return { ...prev, checks: prev.checks.map(c => c.id === check.id ? { ...c, status: "APPROVED" } : c) };
-        });
-      } catch { failed++; }
-    }
-    setApprovingAll(false);
-    if (failed > 0) {
-      toast.error(`${failed} check(s) failed to approve.`);
-    } else {
-      toast.success(`All checks approved! Returning to Dashboard...`);
-      setTimeout(() => router.push("/"), 1500);
+    try {
+      const role = getAuthRole();
+      const res = await fetch(`/api/checks/batch/${apiId}/approve_all`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${getAuthToken()}`, "X-User-Role": role },
+      });
+      if (!res.ok) throw new Error("Bulk approve failed");
+      
+      toast.success(`Successfully approved all checks!`);
+      // Refresh data
+      await fetchBatch(true);
+      setShowReviewAnyway(false); // Go to summary
+    } catch (err: unknown) {
+      toast.error(err instanceof Error ? err.message : "Bulk approve failed");
+    } finally {
+      setApprovingAll(false);
     }
   };
 
@@ -609,15 +625,6 @@ export default function ReviewPage() {
             <kbd>←</kbd><kbd>→</kbd> navigate · <kbd>A</kbd> approve · <kbd>R</kbd> reject
           </div>
 
-          <button
-            onClick={handleApproveAll}
-            disabled={approvingAll}
-            className="hidden md:flex items-center gap-1.5 px-3 py-2 rounded-xl bg-emerald-500/10 text-emerald-500 text-xs font-bold hover:bg-emerald-500/20 transition-all border border-emerald-500/20 disabled:opacity-50"
-          >
-            <CheckSquare className="w-3.5 h-3.5" />
-            {approvingAll ? "Approving…" : "Approve All"}
-          </button>
-
           {/* History */}
           <button
             onClick={() => setHistoryOpen(!historyOpen)}
@@ -629,6 +636,19 @@ export default function ReviewPage() {
             <History className="w-3.5 h-3.5" />
             History
           </button>
+
+          {!allProcessed && (
+            <button
+              onClick={handleApproveAll}
+              disabled={approvingAll}
+              className="hidden lg:flex items-center gap-2 px-4 py-2 rounded-xl bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 text-xs font-bold transition-all border border-emerald-500/20 disabled:opacity-50"
+            >
+              <CheckCircle2 className="w-4 h-4" />
+              {approvingAll ? "Approving..." : "Bulk Approve"}
+            </button>
+          )}
+
+          <div className="w-px h-6 bg-border-custom mx-1" />
 
           <button onClick={() => setCurrentIndex(Math.max(0, currentIndex - 1))} disabled={currentIndex === 0}
             className="p-2 rounded-xl bg-black/5 dark:bg-white/5 hover:bg-black/10 dark:hover:bg-white/10 disabled:opacity-30 transition-colors">
@@ -765,7 +785,16 @@ export default function ReviewPage() {
 
               <div className="flex gap-4">
                 <div className="space-y-1 flex-1">
-                  <label className="text-xs font-bold uppercase tracking-wider text-slate-500">Routing #</label>
+                  <div className="flex items-center gap-2">
+                    <label className="text-xs font-bold uppercase tracking-wider text-slate-500">Routing #</label>
+                    {currentCheck?.validation_notes?.includes("Math repair") || currentCheck?.validation_notes?.includes("tesseract") ? (
+                      <span className="text-[9px] font-black uppercase tracking-wider px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400 border border-amber-500/20">🔧 Auto-Corrected</span>
+                    ) : currentCheck?.validation_notes?.includes("Routing Number") ? (
+                      <span className="text-[9px] font-black uppercase tracking-wider px-1.5 py-0.5 rounded bg-red-500/20 text-red-400 border border-red-500/20">⚠ Check Routing</span>
+                    ) : editForm.routing_number && editForm.routing_number.length === 9 ? (
+                      <span className="text-[9px] font-black uppercase tracking-wider px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-400 border border-emerald-500/20">✓ Valid</span>
+                    ) : null}
+                  </div>
                   <div className="relative">
                     <input type="text" value={editForm.routing_number} onChange={e => setEditForm({ ...editForm, routing_number: e.target.value })}
                       className="w-full px-4 py-3 pr-10 rounded-xl border border-border-custom bg-black/5 dark:bg-white/5 text-foreground font-medium focus:ring-2 focus:ring-indigo-500/50 focus:outline-none transition-all" />
@@ -798,10 +827,18 @@ export default function ReviewPage() {
                     initial={{ opacity: 0, height: 0 }}
                     animate={{ opacity: 1, height: "auto" }}
                     exit={{ opacity: 0, height: 0 }}
-                    className="mb-4 p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-600 dark:text-emerald-400 text-sm font-medium flex items-center justify-center gap-2"
+                    className={cn(
+                      "mb-4 p-3 rounded-xl border text-sm font-medium flex items-center justify-center gap-2",
+                      savedStatus === "APPROVED"
+                        ? "bg-emerald-500/10 border-emerald-500/20 text-emerald-600 dark:text-emerald-400"
+                        : "bg-red-500/10 border-red-500/20 text-red-600 dark:text-red-400"
+                    )}
                   >
-                    <CheckCircle2 className="w-4 h-4" />
-                    Check Approved & Saved!
+                    {savedStatus === "APPROVED" ? (
+                      <><CheckCircle2 className="w-4 h-4" /> Check Approved &amp; Saved!</>
+                    ) : (
+                      <><XCircle className="w-4 h-4" /> Check Rejected &amp; Saved.</>
+                    )}
                   </motion.div>
                 )}
               </AnimatePresence>
