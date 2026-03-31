@@ -1,3 +1,13 @@
+---
+title: CPS Backend
+emoji: 🏦
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
 # 🏦 CPS — Quick Track Check System
 
 A full-stack AI-powered web application that automatically extracts structured financial data from business banking checks (PDFs and Images). Upload one or more checks, and leverage OpenAI's Vision models for high-accuracy data extraction, robust MICR validation, and full audit logging.
