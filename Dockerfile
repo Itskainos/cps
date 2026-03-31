@@ -21,7 +21,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the server directory and other necessary files
 COPY server/ ./server/
-COPY public/ ./public/
 COPY .env.local* ./
 
 # Hugging Face Spaces default port is 7860
