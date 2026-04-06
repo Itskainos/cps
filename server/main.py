@@ -30,7 +30,7 @@ def get_safe_filename(filename: str) -> str:
     return re.sub(r'[^a-zA-Z0-9._-]', '_', filename)
 
 # Local imports
-from .ai_extractor import extract_check_data_via_ai, extract_micr_with_tesseract, is_likely_deposit_slip
+from .ai_extractor import extract_check_data_via_ai, extract_check_batch_via_ai, extract_micr_with_tesseract, extract_micr_via_smart_ai_crop, is_likely_deposit_slip
 from .models import CheckBatch, Check, CheckStatus, Base, AuditLog, User
 from .database import get_db, engine, SessionLocal
 from .validators import validate_extracted_check_data, is_valid_routing, try_repair_routing
@@ -280,139 +280,188 @@ def _store_check_image(file_bytes: bytes, object_name: str, content_type: str = 
     return f"/api/uploads/{object_name}"
 
 
-async def _process_single_check(
-    check_bytes: bytes, filename: str, batch_id: int, db: Session, table_data: dict = None
-) -> dict:
-    """Run AI extraction on a single check image and save to DB."""
-
-    # Pre-screen: Fast keyword scan to catch deposit slips before wasting AI API calls
-    if is_likely_deposit_slip(check_bytes):
-        logger.info(f"Pre-screen blocked deposit slip: {filename}")
-        return {"status": "SKIPPED", "filename": filename, "reason": "deposit_slip_prescreened"}
-
+async def _process_check_chunk(
+    chunk: list, batch_id: int, table_data: dict, db: Session
+) -> list:
+    """Run AI extraction on a chunk of check images via a single batch request and save to DB."""
+    
+    valid_checks = []
+    skipped_results = []
+    
+    # 1. Pre-screen deposit slips
+    for check_bytes, filename in chunk:
+        if is_likely_deposit_slip(check_bytes):
+            logger.info(f"Pre-screen blocked deposit slip: {filename}")
+            skipped_results.append({"status": "SKIPPED", "filename": filename, "reason": "deposit_slip_prescreened"})
+        else:
+            valid_checks.append((check_bytes, filename))
+            
+    if not valid_checks:
+        return skipped_results
+        
+    # 2. Batch AI call
     try:
-        extracted_data = await extract_check_data_via_ai(check_bytes, filename, table_data)
+        batch_results = await extract_check_batch_via_ai(valid_checks, table_data)
     except Exception as e:
         import traceback
         error_trace = traceback.format_exc()
-        logger.error(f'"AI extraction failed for {filename}: {str(e)}\n{error_trace}"')
-        extracted_data = {
+        logger.error(f"AI batch extraction failed: {str(e)}\n{error_trace}")
+        batch_results = [{
             "store_name": None, "check_number": None, "check_date": None,
             "payee_name": None, "amount": None, "memo": None,
             "bank_name": None, "routing_number": None, "account_number": None,
             "confidence_score": 0.0
-        }
+        } for _ in valid_checks]
 
-    # Guard: Skip completely empty records (AI crash, confidence 0, all key fields blank)
-    def _is_empty(v): return v is None or (isinstance(v, str) and v.strip() == "") or v == 0
-    key_fields = [extracted_data.get(k) for k in ["store_name", "payee_name", "amount", "check_number"]]
-    if all(_is_empty(f) for f in key_fields):
-        logger.info(f"Skipping empty record for {filename} — all key fields blank.")
-        return {"status": "SKIPPED", "filename": filename, "reason": "empty_record"}
+    final_results = []
+    
+    # 3. Process each individual check result
+    for i, (check_bytes, filename) in enumerate(valid_checks):
+        extracted_data = batch_results[i]
+        
+        # Guard: Skip completely empty records
+        def _is_empty(v): return v is None or (isinstance(v, str) and str(v).strip() == "") or v == 0
+        key_fields = [extracted_data.get(k) for k in ["store_name", "payee_name", "amount", "check_number"]]
+        if all(_is_empty(f) for f in key_fields):
+            logger.info(f"Skipping empty record for {filename} — all key fields blank.")
+            final_results.append({"status": "SKIPPED", "filename": filename, "reason": "empty_record"})
+            continue
 
-    status_str, notes = validate_extracted_check_data(extracted_data)
+        status_str, notes = validate_extracted_check_data(extracted_data)
 
-    # ROUTING REPAIR PIPELINE
-    routing_raw = re.sub(r'\D', '', str(extracted_data.get("routing_number", "")))
-    if not is_valid_routing(routing_raw):
-        # Step 1: Fast math repair — compute the missing ABA check digit (works for 8-digit AI misreads)
-        repaired = try_repair_routing(routing_raw)
-        if repaired:
-            logger.info(f"Math repair SUCCESS for {filename}: '{routing_raw}' → '{repaired}'")
-            extracted_data['routing_number'] = repaired
-            extracted_data['routing_repair_method'] = 'check_digit_math'
-            status_str, notes = validate_extracted_check_data(extracted_data)
-        else:
-            # Step 2: Tesseract MICR fallback (heavier, slower, but works for completely wrong reads)
-            logger.info(f"Math repair failed for '{routing_raw}', triggering Tesseract MICR fallback...")
-            fallback_routing = extract_micr_with_tesseract(check_bytes)
-            if fallback_routing:
-                logger.info(f"Tesseract MICR fallback SUCCESS for {filename}: {fallback_routing}")
-                extracted_data['routing_number'] = fallback_routing
-                extracted_data['routing_repair_method'] = 'tesseract_micr'
+        # ROUTING REPAIR PIPELINE
+        # GPT-4o-mini reliably hallucinates ABA-valid routing numbers.
+        # Tesseract reading actual MICR ink is more reliable.
+        routing_raw = re.sub(r'\D', '', str(extracted_data.get("routing_number", "")))
+
+        # 1. Always run Tesseract first — it reads real MICR ink
+        # Pass the extracted check_number as a negative filter to avoid collisions
+        kn_check = str(extracted_data.get("check_number", ""))
+        tesseract_routing = extract_micr_with_tesseract(check_bytes, known_check_number=kn_check)
+        smart_ai_routing = None
+
+        if tesseract_routing and is_valid_routing(tesseract_routing):
+            if tesseract_routing != routing_raw:
+                logger.info(f"Tesseract OVERRIDE AI for {filename}: '{routing_raw}' → '{tesseract_routing}'")
+                extracted_data['routing_number'] = tesseract_routing
+                extracted_data['routing_repair_method'] = 'tesseract_primary'
                 status_str, notes = validate_extracted_check_data(extracted_data)
             else:
-                logger.warning(f"All routing repair methods failed for {filename}. Keeping MANUAL_REVIEW.")
+                logger.info(f"Tesseract CONFIRMED AI routing for {filename}: '{tesseract_routing}'")
+                # No repair method flag: AI and Tesseract agree — high confidence
+        else:
+            # 2. Tesseract failed — try Smart AI Crop Fallback
+            smart_ai_routing = await extract_micr_via_smart_ai_crop(check_bytes, known_check_number=kn_check)
+            
+            if smart_ai_routing and is_valid_routing(smart_ai_routing):
+                logger.info(f"Smart AI Crop OVERRIDE for {filename}: '{routing_raw}' → '{smart_ai_routing}'")
+                extracted_data['routing_number'] = smart_ai_routing
+                extracted_data['routing_repair_method'] = 'smart_ai_crop'
+                status_str, notes = validate_extracted_check_data(extracted_data)
+            else:
+                # 3. Both failed — fall back to original AI's number or Math repair
+                if not is_valid_routing(routing_raw):
+                    repaired = try_repair_routing(routing_raw)
+                    if repaired:
+                        logger.info(f"Math repair SUCCESS for {filename}: '{routing_raw}' → '{repaired}'")
+                        extracted_data['routing_number'] = repaired
+                        extracted_data['routing_repair_method'] = 'check_digit_math'
+                        status_str, notes = validate_extracted_check_data(extracted_data)
+                    else:
+                        logger.warning(f"All extraction methods failed for {filename}. MANUAL_REVIEW.")
+                        extracted_data['routing_number'] = routing_raw
+                else:
+                    # AI had a valid-checksumming number but Tesseract and Smart Crop couldn't confirm it
+                    logger.warning(f"Primary scan unconfirmed for {filename}; accepting global AI routing '{routing_raw}' but flagging.")
+                    extracted_data['routing_repair_method'] = 'ai_unconfirmed'
+                    status_str, notes = validate_extracted_check_data(extracted_data)
 
-    # Filter out non-check documents (like Deposit Slips)
-    doc_type = extracted_data.get("document_type", "check")
-    if doc_type != "check":
-        logger.info(f"Skipping non-check document: {filename} (Type: {doc_type}).")
-        return {"status": "SKIPPED", "filename": filename, "document_type": doc_type}
+        # Filter out non-check documents (like Deposit Slips)
+        doc_type = extracted_data.get("document_type", "check")
+        if doc_type != "check":
+            logger.info(f"Skipping non-check document: {filename} (Type: {doc_type}).")
+            final_results.append({"status": "SKIPPED", "filename": filename, "document_type": doc_type})
+            continue
 
-    safe_name = get_safe_filename(filename)
-    object_name = f"{batch_id}_{safe_name}"
-    image_url = _store_check_image(check_bytes, object_name)
+        safe_name = get_safe_filename(filename)
+        object_name = f"{batch_id}_{safe_name}"
+        image_url = _store_check_image(check_bytes, object_name)
 
-    date_obj = None
-    try:
-        if extracted_data.get("check_date"):
-            date_obj = datetime.strptime(extracted_data.get("check_date"), "%Y-%m-%d").date()
-    except ValueError:
-        pass
+        date_obj = None
+        try:
+            if extracted_data.get("check_date"):
+                date_obj = datetime.strptime(extracted_data.get("check_date"), "%Y-%m-%d").date()
+        except ValueError:
+            pass
 
-    new_check = Check(
-        batch_id=batch_id,
-        store_name=extracted_data.get("store_name"),
-        check_number=extracted_data.get("check_number"),
-        check_date=date_obj,
-        payee=extracted_data.get("payee_name"),
-        amount=extracted_data.get("amount"),
-        memo=extracted_data.get("memo"),
-        bank=extracted_data.get("bank_name"),
-        routing_number=extracted_data.get("routing_number"),
-        account_number=extracted_data.get("account_number"),
-        confidence_score=extracted_data.get("confidence_score"),
-        status=CheckStatus(status_str),
-        validation_notes=notes,
-        s3_image_url=image_url
-    )
-    db.add(new_check)
-    db.commit()
-    db.refresh(new_check)
+        new_check = Check(
+            batch_id=batch_id,
+            store_name=extracted_data.get("store_name"),
+            check_number=extracted_data.get("check_number"),
+            check_date=date_obj,
+            payee=extracted_data.get("payee_name"),
+            amount=extracted_data.get("amount"),
+            memo=extracted_data.get("memo"),
+            bank=extracted_data.get("bank_name"),
+            routing_number=extracted_data.get("routing_number"),
+            account_number=extracted_data.get("account_number"),
+            confidence_score=extracted_data.get("confidence_score"),
+            status=CheckStatus(status_str),
+            validation_notes=notes,
+            s3_image_url=image_url,
+            reviewed_by="SYSTEM" if status_str == "APPROVED" else None,
+            reviewed_at=datetime.utcnow() if status_str == "APPROVED" else None
+        )
+        db.add(new_check)
+        db.commit()
+        db.refresh(new_check)
 
-    return {
-        "check_id": new_check.id,
-        "filename": filename,
-        "status": status_str,
-        "confidence_score": new_check.confidence_score
-    }
+        final_results.append({
+            "check_id": new_check.id,
+            "filename": filename,
+            "status": status_str,
+            "confidence_score": new_check.confidence_score
+        })
+        
+    return skipped_results + final_results
 
 
 async def _process_batch_in_background(
     check_images: list, batch_id: int, table_data: dict
 ):
     """
-    Background worker that processes checks using an asyncio.Semaphore to avoid OpenAI 429s.
+    Background worker that processes checks in chunks.
+    Sends up to 5 checks to GPT-4o-mini per API call to drastically reduce duplicate tokens.
     """
     import asyncio
     
-    # Higher concurrency (5) and faster stagger (0.5s) for gpt-4o-mini
-    semaphore = asyncio.Semaphore(5)
+    CHUNK_SIZE = 5
+    chunks = [check_images[i:i + CHUNK_SIZE] for i in range(0, len(check_images), CHUNK_SIZE)]
     
-    async def _sem_process(img_bytes, img_filename, index: int):
-        # Staggered start: wait 0.5 seconds per check in the queue
-        await asyncio.sleep(index * 0.5)
+    # We only process 2 chunks concurrently (up to 10 images total globally in flight) 
+    # to keep memory low. OpenAI allows decent throughput for vision limits.
+    semaphore = asyncio.Semaphore(2)
+    
+    async def _sem_process_chunk(chunk, index: int):
+        await asyncio.sleep(index * 1.5) # Stagger starts to distribute load over time
         
         async with semaphore:
-            # Create a fresh DB session per check to ensure thread-safety
-            # Add a small retry loop for the DB session in case of SSL/timeout issues
             max_db_retries = 2
             for db_attempt in range(max_db_retries):
                 try:
                     with SessionLocal() as db:
-                        return await _process_single_check(img_bytes, img_filename, batch_id, db, table_data)
+                        return await _process_check_chunk(chunk, batch_id, table_data, db)
                 except Exception as db_err:
                     if "SSL connection" in str(db_err) and db_attempt < max_db_retries -1:
-                        logger.warning(f"DB SSL Connection reset for {img_filename}, retrying...")
+                        logger.warning(f"DB SSL Connection reset for chunk {index}, retrying...")
                         await asyncio.sleep(1)
                     else:
-                        logger.error(f"Fatal DB Error for {img_filename}: {str(db_err)}")
+                        logger.error(f"Fatal DB Error for chunk {index}: {str(db_err)}")
                         raise
 
-    logger.info(f"Background processing started for {len(check_images)} checks on batch {batch_id} (Concurrency Limit=5, Staggered=0.5s)")
+    logger.info(f"Background processing started for {len(check_images)} checks (grouped into {len(chunks)} chunks of <=5) on batch {batch_id}")
     
-    tasks = [_sem_process(img_bytes, img_filename, i) for i, (img_bytes, img_filename) in enumerate(check_images)]
+    tasks = [_sem_process_chunk(c, i) for i, c in enumerate(chunks)]
     await asyncio.gather(*tasks, return_exceptions=True)
 
     logger.info(f"Background processing complete for batch {batch_id}")
