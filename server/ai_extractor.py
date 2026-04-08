@@ -8,7 +8,7 @@ import traceback
 import pytesseract
 from PIL import Image
 from openai import AsyncOpenAI
-from typing import Dict, Any, Tuple, Optional
+from typing import Dict, Any, Tuple, Optional, List
 import fitz # PyMuPDF
 from .validators import is_valid_routing
 
@@ -123,6 +123,144 @@ def extract_micr_with_tesseract(image_bytes: bytes, known_check_number: Optional
         logger.error(f"Tesseract crashed: {e}")
         return None
 
+def extract_micr_full_line(image_bytes: bytes, known_check_number: Optional[str] = None) -> Optional[str]:
+    """
+    Final robust Sweeping-Window MICR extraction for Windows.
+    Uses 'PROGRA~1' short-path to bypass Windows CLI space-handling bugs.
+    """
+    try:
+        import numpy as np
+        import cv2
+
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        img_cv = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
+        if img_cv is None:
+            pil_img = Image.open(io.BytesIO(image_bytes)).convert("L")
+            img_cv = np.array(pil_img)
+
+        h, w = img_cv.shape
+
+        # Sweeping Ratios: [Bottom 35% to Bottom 18%]
+        sweep_ratios = [0.65, 0.72, 0.78, 0.82]
+        
+        # Space-safe short paths for Windows Tesseract
+        tess_bin = r'C:\PROGRA~1\Tesseract-OCR\tesseract.exe'
+        tessdata_dir = r'C:\PROGRA~1\Tesseract-OCR\tessdata'
+        
+        if not os.path.exists(tess_bin):
+            # Fallback to standard path if no 8.3 shortnames
+            tess_bin = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+            tessdata_dir = r'C:\Program Files\Tesseract-OCR\tessdata'
+            
+        pytesseract.pytesseract.tesseract_cmd = tess_bin
+        os.environ['TESSDATA_PREFIX'] = tessdata_dir
+
+        for clip in sweep_ratios:
+            crop = img_cv[int(h * clip):, :]
+            
+            # --- ADD WHITE PADDING TO BOTTOM ---
+            # Prevents characters at the absolute edge from being blurred or cut during scale
+            crop = cv2.copyMakeBorder(crop, 0, 10, 0, 0, cv2.BORDER_CONSTANT, value=255)
+            
+            # High-fidelity 4x upscale
+            crop_scaled = cv2.resize(crop, None, fx=4.0, fy=4.0, interpolation=cv2.INTER_CUBIC)
+            
+            # Denoising stage (crucial for Prosperity Bank checks)
+            denoised = cv2.medianBlur(crop_scaled, 5)
+            
+            # Maximize contrast
+            clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
+            enhanced = clahe.apply(denoised)
+            _, otsu = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            
+            pil_crop = Image.fromarray(otsu)
+            
+            for psm in [7, 6]:
+                try:
+                    raw = pytesseract.image_to_string(pil_crop, config=f'--psm {psm}')
+                    digits_only = re.sub(r'\D+', '', raw)
+                    
+                    if len(digits_only) >= 9:
+                        # CRITICAL: Prioritize finding a valid routing number above all else
+                        found_routing = False
+                        blocks = re.sub(r'\D+', ' ', raw).split()
+                        for b in blocks:
+                            if len(b) == 9 and is_valid_routing(b):
+                                found_routing = True
+                                break
+                        
+                        if found_routing:
+                            logger.info(f"MICR High-Confidence Match [Clip {clip}, PSM {psm}]: {repr(raw.strip())}")
+                            return raw
+                        elif len(digits_only) >= 15:
+                             # Secondary match for noisy lines
+                             logger.info(f"MICR Secondary Match [Clip {clip}, PSM {psm}]: {repr(raw.strip())}")
+                             return raw
+                except Exception as ocr_err:
+                    logger.debug(f"Sweep trial failed: {ocr_err}")
+
+        return None
+    except Exception as e:
+        logger.error(f"extract_micr_full_line failed: {e}")
+        logger.error(traceback.format_exc())
+        return None
+
+
+
+
+
+
+
+
+def parse_account_from_micr_text(raw_micr: str, routing_number: Optional[str], known_check_number: Optional[str] = None) -> Optional[str]:
+    """
+    Precision extraction of account number.
+    Prioritizes blocks found AFTER the routing number in the text stream, 
+    matching standard check layout.
+    """
+    try:
+        if not raw_micr:
+            return None
+            
+        # Normalization: Treat common MICR symbol artifacts as spaces
+        text = raw_micr.replace('⑈', ' ').replace('⑆', ' ').replace('⑇', ' ').replace('⑉', ' ')
+        text = text.replace('|', ' ').replace('!', ' ').replace('~', ' ').replace('=', ' ')
+        
+        # Extract only digit blocks
+        raw_digits = re.sub(r'[^0-9]', ' ', text).split()
+        
+        # 1. Identify valid routing block (must be 9 digits and pass checksum)
+        found_routing = None
+        for b in raw_digits:
+            if len(b) == 9 and is_valid_routing(b):
+                found_routing = b
+                break
+                
+        # 2. Extract significant blocks (Account numbers are 5-12 digits)
+        # We explicitly EXCLUDE the check number and the routing number
+        significant_blocks = [b for b in raw_digits if len(b) >= 5 and b != found_routing and b != known_check_number]
+        
+        if found_routing and significant_blocks:
+            # Standard MICR layout: [Check#] [Routing] [Account] OR [Routing] [Account] [Check#]
+            # In the text stream, look for blocks that appear strictly AFTER the routing number
+            parts = text.split(found_routing)
+            if len(parts) > 1:
+                after_routing = re.sub(r'[^0-9]', ' ', parts[1]).split()
+                for b in after_routing:
+                    # Filter out short fragments or blocks that are clearly check numbers
+                    if 5 <= len(b) <= 12 and b != known_check_number:
+                        return b
+
+        # Fallback: Just return the largest block that isn't the routing or check number
+        if significant_blocks:
+            return max(significant_blocks, key=len)
+            
+        return None
+    except Exception as e:
+        logger.error(f"parse_account_from_micr_text failed: {e}")
+        return None
+
+
 async def extract_micr_via_smart_ai_crop(image_bytes: bytes, known_check_number: Optional[str] = None) -> Optional[str]:
     """
     High-confidence fallback using gpt-4o for robust OCR.
@@ -176,11 +314,176 @@ async def extract_micr_via_smart_ai_crop(image_bytes: bytes, known_check_number:
                 return digits
             
         return None
-            
-        return None
     except Exception as e:
         logger.error(f"Smart AI Crop failed: {e}")
         return None
+
+async def extract_check_data_via_tesseract_fallback(image_bytes: bytes, filename: str) -> Dict[str, Any]:
+    """
+    Fallback extraction using pytesseract with fixed heuristics based on standard Lama Corporation checks.
+    Invoked automatically when OpenAI Quota is exceeded.
+    """
+    try:
+        import numpy as np
+        import cv2
+        import pytesseract
+        from PIL import Image
+        import io
+        import re
+        
+        # Load image via OpenCV for preprocessing
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        img_cv = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
+        if img_cv is None:
+            pil_img = Image.open(io.BytesIO(image_bytes)).convert("L")
+            img_cv = np.array(pil_img)
+            
+        img_cv, _ = deskew_image(img_cv)
+        H, W = img_cv.shape
+
+        # Isolate distinct geometric regions to prevent Tesseract layout confusion
+        top_left_img = Image.fromarray(img_cv[:int(H*0.35), :int(W*0.40)])
+        top_right_img = Image.fromarray(img_cv[:int(H*0.35), int(W*0.60):])
+        top_full_img = Image.fromarray(img_cv[:int(H*0.30), :])  # Full width for bank name
+        payee_img = Image.fromarray(img_cv[int(H*0.35):int(H*0.65), int(W*0.05):int(W*0.70)])
+        amt_img = Image.fromarray(img_cv[int(H*0.35):int(H*0.70), int(W*0.65):])
+        memo_img = Image.fromarray(img_cv[int(H*0.60):int(H*0.85), :int(W*0.50)])
+        micr_img = Image.fromarray(img_cv[int(H*0.75):, :])
+
+        top_left_text = pytesseract.image_to_string(top_left_img)
+        top_right_text = pytesseract.image_to_string(top_right_img, config='--psm 6')
+        top_full_text = pytesseract.image_to_string(top_full_img)
+        payee_text = pytesseract.image_to_string(payee_img, config='--psm 6')
+        amt_text = pytesseract.image_to_string(amt_img, config='--psm 6')
+        memo_text = pytesseract.image_to_string(memo_img, config='--psm 6')
+        bottom_text = pytesseract.image_to_string(micr_img, config='--psm 6')
+
+        lines = [l.strip() for l in top_left_text.split('\n') if l.strip()]
+        
+        data = {
+            "document_type": "check",
+            "store_name": ' '.join(lines[:2]) if len(lines) >= 2 else (lines[0] if lines else "Unknown Store"),
+            "check_number": None,
+            "check_date": None,
+            "payee_name": None,
+            "amount": None,
+            "memo": None,
+            "bank_name": None,
+            "routing_number": None,
+            "account_number": None,
+            "confidence_score": 0.40,  # Lower to ensure manual review priority
+            "status": "MANUAL_REVIEW_REQUIRED", 
+            "validation_notes": "Extracted via Legacy Tesseract Fallback (OpenAI Quota Exceeded). Please review all fields."
+        }
+        
+        # Date (Top right)
+        date_match = re.search(r'(?i)Date:\s*(\d{1,2}/\d{1,2}/\d{4})', top_right_text)
+        if date_match:
+            from datetime import datetime
+            try:
+                date_obj = datetime.strptime(date_match.group(1), "%m/%d/%Y")
+                data["check_date"] = date_obj.strftime("%Y-%m-%d")
+            except:
+                data["check_date"] = date_match.group(1)
+                
+        # Check number (Top right)
+        nums = re.findall(r'\b\d{5,8}\b', top_right_text)
+        if nums: data["check_number"] = nums[-1]
+
+        # Amount (Isolated right middle)
+        # Handle both "$2,005.82" and "$ 110.96" (space after dollar sign)
+        amt_match = re.search(r'\$\s*([0-9]{1,3}(?:,[0-9]{3})*\.[0-9]{2})', amt_text)
+        if not amt_match:
+            # Fallback: strip everything except digits/dot/comma then match
+            clean_amt = re.sub(r'[^\d\.\,]', '', amt_text)
+            amt_match2 = re.search(r'([0-9]{1,3}(?:,[0-9]{3})*\.[0-9]{2})', clean_amt)
+            if amt_match2:
+                data["amount"] = float(amt_match2.group(1).replace(",", ""))
+        else:
+            data["amount"] = float(amt_match.group(1).replace(",", ""))
+            
+        def _clean_field(text: str) -> str:
+            """Strip common OCR noise: leading/trailing non-alphanumeric junk."""
+            # Remove leading symbols/punctuation that aren't part of a word
+            text = re.sub(r'^[\s\~\>\*\-\_\—\»\©\@\!\|\\\/\.\,\;\:\'\"]+', '', text)
+            # Remove trailing symbols
+            text = re.sub(r'[\s\~\>\*\_\—\»\©\@\!\|\\\/\;\:\'\"]+$', '', text)
+            return text.strip()
+
+        # Payee (Isolated left middle)
+        clean_payee = re.sub(r'(?i)PAY\s*TO\s*THE\s*(?:ORDER\s*OF)?', '', payee_text)
+        clean_payee = re.sub(r'(?i)DOLLARS', '', clean_payee)
+        # Grab first non-empty line that looks like a name
+        for line in clean_payee.split('\n'):
+            line = _clean_field(line)
+            if len(line) >= 2 and not re.search(r'(?i)THOUSAND|HUNDRED|ORDER\s*OF', line):
+                data["payee_name"] = line
+                break
+            
+        # Memo (Isolated bottom left)
+        memo_match = re.search(r'(?i)MEMO:\s*(.*)', memo_text)
+        if memo_match:
+            data["memo"] = _clean_field(memo_match.group(1))
+            
+        # Bank Name (Full-width top strip — "Prosperity Bank" is in the center of the check)
+        if re.search(r'(?i)Prosperity\s*Bank', top_full_text):
+            data["bank_name"] = "Prosperity Bank"
+        elif re.search(r'(?i)Prosperity\s*Bank', top_left_text):
+            data["bank_name"] = "Prosperity Bank"
+            
+        # Store Name: grab the top business name lines, stopping before address lines
+        # Only filter lines that START with a digit (e.g. "1501 Pipeline") or contain address keywords
+        # Do NOT filter "Operating 104" — it has digits but doesn't START with one
+        address_pattern = re.compile(r'(?i)^\d|(?:road|street|avenue|blvd|drive|texas|TX)\b|\b\d{5}\b')
+        name_lines = [_clean_field(l) for l in lines if not address_pattern.search(l) and _clean_field(l)]
+        if name_lines:
+            # Take up to 2 lines (company name + operating unit/department)
+            data["store_name"] = ' '.join(name_lines[:2])
+             
+        # Routing + Account — use the dedicated MICR pipeline
+        kn_check = data.get("check_number")
+        full_micr_text = extract_micr_full_line(image_bytes, known_check_number=kn_check)
+        
+        if full_micr_text:
+            # 1. Try to find routing number in this text
+            raw_digits = re.sub(r'\D+', ' ', full_micr_text).split()
+            found_routing = None
+            for b in raw_digits:
+                if len(b) == 9 and is_valid_routing(b):
+                    found_routing = b
+                    break
+            
+            if found_routing:
+                data["routing_number"] = found_routing
+                # 2. Extract account based on routing position
+                account = parse_account_from_micr_text(full_micr_text, found_routing, known_check_number=kn_check)
+                if account:
+                    data["account_number"] = account
+            else:
+                # Fallback: if no valid routing found, still try to find something for account/routing
+                # Standard pattern: [Check#] [Routing] [Account]
+                significant_blocks = [b for b in raw_digits if len(b) >= 5]
+                if len(significant_blocks) >= 2:
+                    # Last block is almost always the account number
+                    data["account_number"] = significant_blocks[-1]
+                    # The block before it is almost always the routing number
+                    data["routing_number"] = significant_blocks[-2]
+                    
+                    # If we don't have a check number yet, maybe the first one is it
+                    if not data["check_number"] and len(significant_blocks) > 2:
+                        data["check_number"] = significant_blocks[0]
+
+        return data
+
+    except Exception as e:
+        logger.error(f"Tesseract pipeline fallback crashed: {e}")
+        return {
+             "document_type": "check",
+             "status": "MANUAL_REVIEW_REQUIRED",
+             "validation_notes": f"Tesseract Fallback Error: {str(e)}",
+             "confidence_score": 0.0,
+             "skip_repair": True
+        }
 
 def is_likely_deposit_slip(image_bytes: bytes) -> bool:
     """
@@ -257,7 +560,7 @@ Return ONLY raw JSON:
   "bank_name": "string",
   "routing_number": "string (exactly 9 digits)",
   "account_number": "string",
-  "confidence_score": float between 0 and 1
+  "confidence_score": float between 0 and 1 (IMPORTANT: Lower this if MICR is blurry, unsure of digits, or if numbers might be interchanged)
 }
 """
 
@@ -281,8 +584,10 @@ You will be provided with MULTIPLE check images, each labeled with an index (e.g
 7. MEMO: The text on the memo line if present.
 
 ### MICR LINE INSTRUCTIONS (Critical for routing/account accuracy):
+The MICR line at the very bottom of a check contains numbers separated by special transit symbols (⑆) and On-Us symbols (⑈).
 - ROUTING NUMBER: ONLY extract the 9 digits if you see them clearly at the very bottom of the check between transit symbols (⑆). DO NOT guess, DO NOT calculate check digits, and DO NOT extract from the Memo or Invoice lines. If the MICR line is blurry or unreadable, return null. The routing number NEVER starts with "INV" or letters.
 - ACCOUNT NUMBER: The block of digits usually adjacent to the routing number at the bottom.
+- IMPORTANT: On some check formats (e.g. Prosperity Bank), the check number is printed TWICE in the MICR line: once at the very start and once at the end. DO NOT include the check number as part of the account number.
 - NEVER confuse the check number or invoice number with the routing number.
 
 Return ONLY raw JSON in this format:
@@ -299,7 +604,7 @@ Return ONLY raw JSON in this format:
       "bank_name": "string",
       "routing_number": "string (exactly 9 digits)",
       "account_number": "string",
-      "confidence_score": float between 0 and 1
+      "confidence_score": float between 0 and 1 (IMPORTANT: Lower this if MICR is blurry, unsure of digits, or if numbers might be interchanged)
     }
   ]
 }
@@ -385,7 +690,15 @@ async def extract_check_batch_via_ai(checks: list[Tuple[bytes, str]], table_data
             )
             break
         except Exception as e:
-            if "429" in str(e) and attempt < max_retries - 1:
+            error_str = str(e).lower()
+            if "insufficient_quota" in error_str:
+                logger.error(f"OpenAI Quota Exceeded. Triggering Local Tesseract OCR fallback for batch.")
+                fallback_results = []
+                for b, f in checks:
+                    res = await extract_check_data_via_tesseract_fallback(b, f)
+                    fallback_results.append(res)
+                return fallback_results
+            elif "429" in str(e) and attempt < max_retries - 1:
                 logger.warning(f"Batch OpenAI Rate Limit hit, retrying in {retry_delay}s...")
                 await asyncio.sleep(retry_delay)
                 retry_delay *= 2
@@ -407,6 +720,14 @@ async def extract_check_batch_via_ai(checks: list[Tuple[bytes, str]], table_data
             
         # Post-process context validation + alignment detection
         for i, res in enumerate(results):
+            # CLEANUP: If the account number has the check number prepended, strip it. 
+            # This must happen EARLY to allow swap detection to work correctly on polluted data.
+            acc_num = str(res.get('account_number', '')).strip()
+            chk_num = str(res.get('check_number', '')).strip()
+            if chk_num and acc_num.startswith(chk_num):
+                res['account_number'] = acc_num[len(chk_num):].strip()
+                logger.info(f"Early cleanup for check {chk_num}: '{acc_num}' -> '{res['account_number']}'")
+
             if res.get('routing_number') == '123456789':
                 res['routing_number'] = '123456780'
 
@@ -417,7 +738,6 @@ async def extract_check_batch_via_ai(checks: list[Tuple[bytes, str]], table_data
                 if ai_amount is not None and abs(float(ai_amount) - float(exact_amount)) < 0.01:
                     res['table_match'] = True
                     res['check_date'] = iso_date
-                    res['confidence_score'] = min(1.0, float(res.get('confidence_score', 0.8)) + 0.15)
                 else:
                     # Amount mismatch against table — possible AI misalignment
                     res['table_match'] = False
@@ -432,8 +752,22 @@ async def extract_check_batch_via_ai(checks: list[Tuple[bytes, str]], table_data
                 res['table_match'] = False
                 res['table_mismatch_note'] = f"Check #{check_num} not found in Summary Table."
 
-            if not is_valid_routing(res.get('routing_number', '')):
+            is_route_valid = is_valid_routing(res.get('routing_number', ''))
+            conf_penalty = 0.0
+            if not is_route_valid:
                 res['status'] = 'MANUAL_REVIEW_REQUIRED'
+                conf_penalty += 0.50 # Heavy penalty for checksum failure
+
+            # CLEANUP PENALTY: Lower confidence if cleanup was needed
+            if acc_num != str(res.get('account_number', '')).strip():
+                conf_penalty += 0.10
+
+            current_conf = float(res.get('confidence_score', 0.8))
+            res['confidence_score'] = max(0.0, current_conf - conf_penalty)
+
+            # Only give the "Table Match" boost if the routing number is MATHEMATICALLY valid
+            if res.get('table_match') is True and is_route_valid:
+                 res['confidence_score'] = min(1.0, res['confidence_score'] + 0.15)
 
         return results[:len(checks)]
     except Exception as e:
@@ -524,7 +858,11 @@ async def extract_check_data_via_ai(file_bytes: bytes, filename: str, table_data
             )
             break # Success
         except Exception as e:
-            if "429" in str(e) and attempt < max_retries - 1:
+            error_str = str(e).lower()
+            if "insufficient_quota" in error_str:
+                logger.error(f"OpenAI Quota Exceeded for {filename}. Aborting.")
+                raise RuntimeError("QUOTA_EXCEEDED")
+            elif "429" in str(e) and attempt < max_retries - 1:
                 logger.warning(f"OpenAI Rate Limit hit for {filename}, retrying in {retry_delay}s... (Attempt {attempt+1}/{max_retries})")
                 await asyncio.sleep(retry_delay)
                 retry_delay *= 2 # Exponential backoff
@@ -543,6 +881,14 @@ async def extract_check_data_via_ai(file_bytes: bytes, filename: str, table_data
     try:
         data = json.loads(content)
         
+        # CLEANUP: If the account number has the check number prepended, strip it.
+        # This must happen EARLY to allow swap detection to work correctly on polluted data.
+        acc_num = str(data.get('account_number', '')).strip()
+        chk_num = str(data.get('check_number', '')).strip()
+        if chk_num and acc_num.startswith(chk_num):
+            data['account_number'] = acc_num[len(chk_num):].strip()
+            logger.info(f"Early cleanup for single check {chk_num}: '{acc_num}' -> '{data['account_number']}'")
+
         # Force-fix known hallucinations
         if data.get('routing_number') == '123456789':
             data['routing_number'] = '123456780'
@@ -569,9 +915,24 @@ async def extract_check_data_via_ai(file_bytes: bytes, filename: str, table_data
                 data['table_match'] = False
                 data['table_mismatch_note'] = f"Check #{check_num} not found in Summary Table."
 
+        # Post-Logic Confidence Adjustment
+        conf_penalty = 0.0
         # General Checksum validation
-        if not is_valid_routing(data.get('routing_number', '')):
+        is_route_valid = is_valid_routing(data.get('routing_number', ''))
+        if not is_route_valid:
             data['status'] = 'MANUAL_REVIEW_REQUIRED'
+            conf_penalty += 0.50
+
+        # CLEANUP PENALTY: Lower confidence if cleanup was needed
+        if acc_num != str(data.get('account_number', '')).strip():
+            conf_penalty += 0.10
+
+        current_conf = float(data.get('confidence_score', 0.8))
+        data['confidence_score'] = max(0.0, current_conf - conf_penalty)
+
+        # Only give the "Table Match" boost if the routing number is MATHEMATICALLY valid
+        if data.get('table_match') is True and is_route_valid:
+             data['confidence_score'] = min(1.0, data['confidence_score'] + 0.15)
 
         return data
     except Exception as e:

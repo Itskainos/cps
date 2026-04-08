@@ -59,13 +59,19 @@ def validate_extracted_check_data(data: Dict[str, Any]) -> Tuple[str, str]:
     # ── 2. SWAPPED FIELDS DETECTION ──────────────────────────────────────────
     # If the routing number is invalid but the account number passes ABA checksum, 
     # it is highly likely they are swapped in the OCR buffer.
-    if not is_valid_routing(routing) and is_valid_routing(account):
+    # We strip all non-digits from both before checking to be robust.
+    clean_routing = re.sub(r"\D", "", str(data.get("routing_number", "")))
+    clean_account = re.sub(r"\D", "", str(data.get("account_number", "")))
+
+    if not is_valid_routing(clean_routing) and is_valid_routing(clean_account):
         # Perform Auto-Swap
-        data["routing_number"] = account
-        data["account_number"] = routing
+        data["routing_number"] = clean_account
+        data["account_number"] = clean_routing
         info_notes.append("Routing and Account numbers were swapped (detected via ABA checksum)")
         # Update local variables for remaining validation steps
-        routing, account = account, routing
+        routing, account = clean_account, clean_routing
+    else:
+        routing, account = clean_routing, clean_account
 
     # ── 3. CRITICAL FIELD VALIDATION ─────────────────────────────────────────
     if not re.fullmatch(r"^\d{9}$", routing):
@@ -77,8 +83,13 @@ def validate_extracted_check_data(data: Dict[str, Any]) -> Tuple[str, str]:
         critical_notes.append(f"Account Number issue (Expected digits, got '{account}')")
 
     # Check for forced MANUAL_REVIEW_REQUIRED from ai_extractor.py
+    # If the routing number is mathematically valid, we can relax this 
+    # to allow auto-approval even if Tesseract was unconfirmed.
     if data.get("status") == "MANUAL_REVIEW_REQUIRED":
-        critical_notes.append("Force Manual Review Required (Checksum or Extraction Failure)")
+        if is_valid_routing(routing):
+            info_notes.append("Forced Review relaxed: Routing is mathematically valid")
+        else:
+            critical_notes.append("Force Manual Review Required (Checksum or Extraction Failure)")
 
     # ── 4. INFORMATIONAL FLAGS & REPAIR LOGGING ──────────────────────────────
     if data.get("routing_repair_method") == "check_digit_math":

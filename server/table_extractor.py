@@ -20,8 +20,8 @@ def extract_table_data(pdf_bytes: bytes, page_indices: Optional[List[int]] = Non
     """
     check_data = {}
     
-    # Matches dates like 02/15 or 02/15/26 or 02/15/2026
-    date_pattern = re.compile(r'^(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?$')
+    # Matches dates like 02/15 or 02-15 or 02/15/26
+    date_pattern = re.compile(r'^(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?$')
     statement_year = "2026" # Fallback based on known dataset
     
     try:
@@ -38,7 +38,8 @@ def extract_table_data(pdf_bytes: bytes, page_indices: Optional[List[int]] = Non
                 scan_pages = [p for p in page_indices if p < len(pdf.pages)]
             else:
                 # Default: scan first 7 pages (where header tables usually are)
-                scan_pages = range(min(7, len(pdf.pages)))
+                # INCREASED limit to 10 just in case summary is slightly later
+                scan_pages = range(min(10, len(pdf.pages)))
             
             for i in scan_pages:
                 page = pdf.pages[i]
@@ -59,48 +60,64 @@ def extract_table_data(pdf_bytes: bytes, page_indices: Optional[List[int]] = Non
                     line_words = sorted(lines[y0], key=lambda w: w['x0'])
                     texts = [w['text'] for w in line_words]
                     
-                    # Scan across the words in this line looking for Date -> Number -> Amount triplets
-                    for j in range(len(texts) - 2):
-                        match = date_pattern.match(texts[j])
-                        if match:
-                            # Found a date. Next word should be check number or asterisk then number
+                    # Scan across the words in this line looking for triplets
+                    # We jump 3 words at a time if we find a match to avoid overlapping false positives
+                    j = 0
+                    while j < len(texts) - 2:
+                        match_found = False
+                        
+                        # Possible patterns:
+                        # 1. DATE, NUMBER, AMOUNT
+                        # 2. NUMBER, DATE, AMOUNT
+                        
+                        m_date = None
+                        chk_text = None
+                        amt_text = None
+                        
+                        # Try Pattern 1: DATE, NUMBER, AMOUNT
+                        m_date = date_pattern.match(texts[j])
+                        if m_date:
                             chk_text = texts[j+1].replace('*', '').strip()
-                            
-                            if chk_text.isdigit() and len(chk_text) >= 3:
-                                # Next word should be amount
+                            amt_text = texts[j+2].replace('$', '').replace(',', '').strip()
+                        else:
+                            # Try Pattern 2: NUMBER, DATE, AMOUNT
+                            m_date = date_pattern.match(texts[j+1])
+                            if m_date:
+                                chk_text = texts[j].replace('*', '').strip()
                                 amt_text = texts[j+2].replace('$', '').replace(',', '').strip()
-                                
-                                # Sometimes amount is negative or has a trailing minus like 150.00-
-                                is_negative = False
-                                if amt_text.endswith('-'):
-                                    is_negative = True
-                                    amt_text = amt_text[:-1]
-                                elif amt_text.startswith('-'):
-                                    is_negative = True
-                                    amt_text = amt_text[1:]
-                                
-                                # Check if it's a valid float
-                                if amt_text.replace('.', '', 1).isdigit():
-                                    try:
-                                        amount = float(amt_text)
-                                        if is_negative: amount = -amount
+                        
+                        if m_date and chk_text and chk_text.isdigit() and len(chk_text) >= 3:
+                            # Clean up amount string carefully
+                            is_negative = False
+                            if amt_text.endswith('-'):
+                                is_negative = True
+                                amt_text = amt_text[:-1]
+                            elif amt_text.startswith('-'):
+                                is_negative = True
+                                amt_text = amt_text[1:]
+                            
+                            # Check if it's a valid float
+                            if amt_text.replace('.', '', 1).isdigit():
+                                try:
+                                    amount = float(amt_text)
+                                    if is_negative: amount = -amount
+                                    amount = abs(amount)
+                                    
+                                    m, d, y = m_date.groups()
+                                    if not y:
+                                        y = statement_year
+                                    elif len(y) == 2:
+                                        y = "20" + y
                                         
-                                        # Ensure we have absolute value for our use case (checks are debits)
-                                        amount = abs(amount)
-                                        
-                                        # Format Date
-                                        m, d, y = match.groups()
-                                        if not y:
-                                            y = statement_year
-                                        elif len(y) == 2:
-                                            y = "20" + y
-                                            
-                                        iso_date = f"{int(y):04d}-{int(m):02d}-{int(d):02d}"
-                                        
-                                        # Register to source of truth!
-                                        check_data[chk_text] = (iso_date, amount)
-                                    except ValueError:
-                                        pass
+                                    iso_date = f"{int(y):04d}-{int(m):02d}-{int(d):02d}"
+                                    check_data[chk_text] = (iso_date, amount)
+                                    match_found = True
+                                    j += 3 # Move past this triplet
+                                except ValueError:
+                                    pass
+                        
+                        if not match_found:
+                            j += 1
 
     except Exception as e:
         logger.error(f"Failed to extract table data: {e}", exc_info=True)

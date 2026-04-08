@@ -136,10 +136,28 @@ async def startup_event():
                 else:
                     logger.error("Max retries reached. Database initialization failed.")
 
-    # FIRE AND FORGET - do NOT await this. 
+    async def check_stuck_batches():
+        """Log any batches that are still PENDING but haven't been touched in 10+ mins."""
+        await asyncio.sleep(5) # Wait for DB to settle
+        try:
+            with SessionLocal() as db:
+                from datetime import timedelta
+                threshold = datetime.utcnow() - timedelta(minutes=10)
+                stuck = db.query(CheckBatch).filter(
+                    CheckBatch.status == CheckStatus.PENDING,
+                    CheckBatch.created_at < threshold
+                ).all()
+                if stuck:
+                    logger.warning(f"Found {len(stuck)} stuck batches (stale PENDING status): {[b.id for b in stuck]}")
+                    logger.warning("Use /api/checks/batches/{id}/resume to restart them.")
+        except Exception as e:
+            logger.error(f"Stuck batch check failed: {e}")
+
+    # FIRE AND FORGET - do NOT await these. 
     # This allows the healthcheck to respond even if the DB is slow/cold starting.
     import asyncio
     asyncio.create_task(init_db_async())
+    asyncio.create_task(check_stuck_batches())
 
 # ── Static Files ──────────────────────────────────────────────────────────────
 from fastapi.staticfiles import StaticFiles
@@ -154,9 +172,12 @@ try:
         os.makedirs(UPLOAD_DIR, exist_ok=True)
     logger.info(f'"Upload directory verified at: {UPLOAD_DIR}"')
 except Exception as e:
-    logger.error(f'"Volume mount failed, falling back to local: {str(e)}"')
     UPLOAD_DIR = os.path.join(BASE_DIR, "public", "uploads")
     os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# Ensure statements directory exists for PDF persistence
+STATEMENTS_DIR = os.path.join(UPLOAD_DIR, "statements")
+os.makedirs(STATEMENTS_DIR, exist_ok=True)
 
 app.mount("/api/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
@@ -306,11 +327,18 @@ async def _process_check_chunk(
         import traceback
         error_trace = traceback.format_exc()
         logger.error(f"AI batch extraction failed: {str(e)}\n{error_trace}")
+        
+        is_quota = "QUOTA_EXCEEDED" in str(e)
+        note = "AI Quota Exceeded. Please check billing." if is_quota else f"AI Extraction Failed: {str(e)}"
+        
         batch_results = [{
             "store_name": None, "check_number": None, "check_date": None,
             "payee_name": None, "amount": None, "memo": None,
             "bank_name": None, "routing_number": None, "account_number": None,
-            "confidence_score": 0.0
+            "confidence_score": 0.0,
+            "status": "MANUAL_REVIEW_REQUIRED",
+            "validation_notes": note,
+            "skip_repair": True
         } for _ in valid_checks]
 
     final_results = []
@@ -319,15 +347,21 @@ async def _process_check_chunk(
     for i, (check_bytes, filename) in enumerate(valid_checks):
         extracted_data = batch_results[i]
         
-        # Guard: Skip completely empty records
-        def _is_empty(v): return v is None or (isinstance(v, str) and str(v).strip() == "") or v == 0
-        key_fields = [extracted_data.get(k) for k in ["store_name", "payee_name", "amount", "check_number"]]
-        if all(_is_empty(f) for f in key_fields):
-            logger.info(f"Skipping empty record for {filename} — all key fields blank.")
-            final_results.append({"status": "SKIPPED", "filename": filename, "reason": "empty_record"})
-            continue
-
-        status_str, notes = validate_extracted_check_data(extracted_data)
+        is_hard_error = extracted_data.get("status") == "MANUAL_REVIEW_REQUIRED" and bool(extracted_data.get("validation_notes"))
+        
+        if not is_hard_error:
+            # Guard: Skip completely empty records
+            def _is_empty(v): return v is None or (isinstance(v, str) and str(v).strip() == "") or v == 0
+            key_fields = [extracted_data.get(k) for k in ["store_name", "payee_name", "amount", "check_number"]]
+            if all(_is_empty(f) for f in key_fields):
+                logger.info(f"Skipping empty record for {filename} — all key fields blank.")
+                final_results.append({"status": "SKIPPED", "filename": filename, "reason": "empty_record"})
+                continue
+            
+            status_str, notes = validate_extracted_check_data(extracted_data)
+        else:
+            status_str = "MANUAL_REVIEW"
+            notes = extracted_data.get("validation_notes")
 
         # ROUTING REPAIR PIPELINE
         # GPT-4o-mini reliably hallucinates ABA-valid routing numbers.
@@ -337,7 +371,9 @@ async def _process_check_chunk(
         # 1. Always run Tesseract first — it reads real MICR ink
         # Pass the extracted check_number as a negative filter to avoid collisions
         kn_check = str(extracted_data.get("check_number", ""))
+        
         tesseract_routing = extract_micr_with_tesseract(check_bytes, known_check_number=kn_check)
+             
         smart_ai_routing = None
 
         if tesseract_routing and is_valid_routing(tesseract_routing):
@@ -349,7 +385,7 @@ async def _process_check_chunk(
             else:
                 logger.info(f"Tesseract CONFIRMED AI routing for {filename}: '{tesseract_routing}'")
                 # No repair method flag: AI and Tesseract agree — high confidence
-        else:
+        elif not extracted_data.get("skip_repair"):
             # 2. Tesseract failed — try Smart AI Crop Fallback
             smart_ai_routing = await extract_micr_via_smart_ai_crop(check_bytes, known_check_number=kn_check)
             
@@ -550,15 +586,32 @@ async def upload_pdf_batch(
     logger.info(f'"Extracted {len(check_images)} checks from PDF"')
 
     # 3. Create batch (Commit immediately to fix foreign key integrity errors)
+    params = {
+        "table_pages": table_pages,
+        "check_pages": check_pages,
+        "force_scan": force_scan
+    }
+    
     new_batch = CheckBatch(
         created_by=user["username"],
-        status=CheckStatus.PENDING
+        status=CheckStatus.PENDING,
+        parameters_json=json.dumps(params)
     )
     db.add(new_batch)
     db.commit()
     db.refresh(new_batch)
     batch_id = new_batch.id
-    logger.info(f'"Batch created: id={batch_id} by={user["username"]}"')
+    
+    # 3.1 Persist PDF for resume support
+    pdf_filename = f"{batch_id}.pdf"
+    pdf_path = os.path.join(STATEMENTS_DIR, pdf_filename)
+    with open(pdf_path, "wb") as f:
+        f.write(pdf_bytes)
+    
+    new_batch.original_pdf_path = pdf_path
+    db.commit()
+
+    logger.info(f'"Batch created: id={batch_id} by={user["username"]}, PDF saved to {pdf_path}"')
 
     # 4. Start background processing
     background_tasks.add_task(_process_batch_in_background, check_images, batch_id, table_data)
@@ -570,6 +623,63 @@ async def upload_pdf_batch(
         "message": "Check extraction started in background."
     }
 
+
+@app.post("/api/checks/batches/{batch_id}/resume")
+async def resume_batch_endpoint(
+    batch_id: int,
+    background_tasks: BackgroundTasks,
+    user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Resume an interrupted batch by reloading its original PDF and parameters.
+    Clears any un-approved checks in the batch before starting over.
+    """
+    batch = db.query(CheckBatch).filter(CheckBatch.id == batch_id).first()
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+        
+    if not batch.original_pdf_path or not os.path.exists(batch.original_pdf_path):
+        raise HTTPException(status_code=400, detail="Original PDF not found on disk. Cannot resume.")
+
+    # 1. Clear unapproved checks to avoid duplicates on restart
+    db.query(Check).filter(
+        Check.batch_id == batch_id,
+        Check.status != CheckStatus.APPROVED
+    ).delete()
+    db.commit()
+
+    # 2. Reload data
+    with open(batch.original_pdf_path, "rb") as f:
+        pdf_bytes = f.read()
+
+    params = json.loads(batch.parameters_json) if batch.parameters_json else {}
+    table_indices = parse_range_string(params.get("table_pages"), 1000) if params.get("table_pages") else None
+    check_indices = parse_range_string(params.get("check_pages"), 1000) if params.get("check_pages") else None
+    force_scan = params.get("force_scan", False)
+
+    # 3. Re-extract (identical to upload_pdf_batch)
+    try:
+        table_data = extract_table_data(pdf_bytes, page_indices=table_indices)
+        check_images = extract_checks_from_pdf(pdf_bytes, page_indices=check_indices, force_scan=force_scan)
+    except Exception as e:
+        logger.error(f"Resume failed during extraction: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to re-extract during resume: {e}")
+
+    if not check_images:
+        raise HTTPException(status_code=400, detail="No checks found in PDF during resume.")
+
+    # 4. Trigger recovery
+    batch.status = CheckStatus.PENDING
+    db.commit()
+    
+    background_tasks.add_task(_process_batch_in_background, check_images, batch_id, table_data)
+    
+    return {
+        "status": "RESUMED",
+        "batch_id": batch_id,
+        "total_checks": len(check_images)
+    }
 
 # ── Batches ────────────────────────────────────────────────────────────────────
 @app.get("/api/checks/batches")

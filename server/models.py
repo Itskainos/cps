@@ -22,6 +22,10 @@ class CheckBatch(Base):
     created_at = Column(DateTime, default=datetime.utcnow) # Per PRD 3
     status = Column(Enum(CheckStatus), default=CheckStatus.PENDING) # Per PRD 3
     
+    # NEW: Robust processing fields
+    original_pdf_path = Column(String, nullable=True)
+    parameters_json = Column(String, nullable=True) # JSON of table_pages, etc
+    
     # Cascading delete so cleaning batches removes all checks inside
     checks = relationship("Check", back_populates="batch", cascade="all, delete-orphan")
 
