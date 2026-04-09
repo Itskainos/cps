@@ -1,10 +1,10 @@
-"use client";
-
 import { useState, useEffect, useMemo, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useTheme } from "next-themes";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import {
+
   FileText,
   CheckCircle2,
   Table as TableIcon,
@@ -122,6 +122,7 @@ export default function Dashboard() {
   const [mounted, setMounted] = useState(false);
   const toast = useToast();
   const confirm = useConfirm();
+  const router = useRouter();
 
   // Filtering & Pagination
   const [searchQuery, setSearchQuery] = useState("");
@@ -175,7 +176,11 @@ export default function Dashboard() {
       ]);
 
       if (statsRes.status === 401 || batchRes.status === 401) {
-        await logout();
+        // Clear tokens and redirect
+        document.cookie = "auth_token=; path=/; expires=Thu, 01 Jan 1970 00:00:01 GMT;";
+        document.cookie = "auth_role=; path=/; expires=Thu, 01 Jan 1970 00:00:01 GMT;";
+        document.cookie = "last_active=; path=/; expires=Thu, 01 Jan 1970 00:00:01 GMT;";
+        router.push("/login?error=Session+expired.+Please+sign+in+again.");
         return;
       }
 
