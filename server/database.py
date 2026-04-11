@@ -19,7 +19,8 @@ connect_args = {"check_same_thread": False} if SQLALCHEMY_DATABASE_URL.startswit
 
 engine_kwargs = {
     "pool_pre_ping": True,
-    "pool_recycle": 300,
+    "pool_recycle": 60,  # Recycle faster to avoid stale SSL connections
+    "pool_timeout": 30,  # Wait up to 30s for a connection
 }
 
 if not SQLALCHEMY_DATABASE_URL.startswith("sqlite"):

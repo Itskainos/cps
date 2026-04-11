@@ -10,6 +10,7 @@ import csv
 import logging
 import traceback
 import os
+import asyncio
 import re
 import json
 import base64
@@ -30,7 +31,11 @@ def get_safe_filename(filename: str) -> str:
     return re.sub(r'[^a-zA-Z0-9._-]', '_', filename)
 
 # Local imports
-from .ai_extractor import extract_check_data_via_ai, extract_check_batch_via_ai, extract_micr_with_tesseract, extract_micr_via_smart_ai_crop, is_likely_deposit_slip
+from .ai_extractor import (
+    extract_check_data_via_ai, extract_check_batch_via_ai, 
+    extract_micr_with_tesseract, extract_micr_via_smart_ai_crop,
+    is_likely_deposit_slip, AI_PROVIDER
+)
 from .models import CheckBatch, Check, CheckStatus, Base, AuditLog, User
 from .database import get_db, engine, SessionLocal
 from .validators import validate_extracted_check_data, is_valid_routing, try_repair_routing
@@ -54,6 +59,11 @@ class UserUpdate(BaseModel):
 
 # ── App ────────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Quick Track Check System")
+
+# Global Lock for Gemini Processing (Free Tier 15 RPM limit)
+# Moving this to global scope ensures that even multiple simultaneous uploads
+# wait in a single sequential line, preventing 429 "Resource Exhausted" errors.
+gemini_lock = asyncio.Lock()
 
 app.add_middleware(
     CORSMiddleware, # Heartbeat reload trigger
@@ -94,11 +104,15 @@ async def log_requests(request: Request, call_next):
             content={"detail": http_exc.detail}
         )
     except Exception as e:
-        logger.error(f'"CRITICAL ERROR: {str(e)} for {request.url.path}"')
-        logger.error(traceback.format_exc())
+        error_detail = traceback.format_exc()
+        logger.error(f"CRITICAL ERROR on {request.url.path}: {str(e)}\n{error_detail}")
         return JSONResponse(
             status_code=500,
-            content={"detail": "Internal Server Error", "error": str(e)}
+            content={
+                "detail": "Internal Server Error",
+                "error": str(e),
+                "path": request.url.path
+            }
         )
 
 # ── APP STARTUP MARKER ────────────────────────────────────────────────────────
@@ -320,6 +334,12 @@ async def _process_check_chunk(
     if not valid_checks:
         return skipped_results
         
+    # 1.5 Check if batch still exists (Abort if deleted by user)
+    batch = db.query(CheckBatch).filter(CheckBatch.id == batch_id).first()
+    if not batch:
+        logger.info(f"Batch {batch_id} no longer exists. Aborting extraction chunk.")
+        return []
+        
     # 2. Batch AI call
     try:
         batch_results = await extract_check_batch_via_ai(valid_checks, table_data)
@@ -328,8 +348,9 @@ async def _process_check_chunk(
         error_trace = traceback.format_exc()
         logger.error(f"AI batch extraction failed: {str(e)}\n{error_trace}")
         
-        is_quota = "QUOTA_EXCEEDED" in str(e)
-        note = "AI Quota Exceeded. Please check billing." if is_quota else f"AI Extraction Failed: {str(e)}"
+        is_quota = any(q in str(e) for q in ["QUOTA_EXCEEDED", "429", "ResourceExhausted"])
+        p_name = AI_PROVIDER.upper()
+        note = f"AI Quota Exceeded ({p_name}). Please check billing." if is_quota else f"AI Extraction Failed ({p_name}): {str(e)}"
         
         batch_results = [{
             "store_name": None, "check_number": None, "check_date": None,
@@ -359,9 +380,14 @@ async def _process_check_chunk(
                 continue
             
             status_str, notes = validate_extracted_check_data(extracted_data)
+            # Incorporate AI provider warnings (e.g. Fallback notifications) into the validation notes
+            if extracted_data.get("status_warning"):
+                notes = f"{extracted_data['status_warning']} | {notes}" if notes else extracted_data['status_warning']
         else:
             status_str = "MANUAL_REVIEW"
             notes = extracted_data.get("validation_notes")
+            if extracted_data.get("status_warning"):
+                notes = f"{extracted_data['status_warning']} | {notes}" if notes else extracted_data['status_warning']
 
         # ROUTING REPAIR PIPELINE
         # GPT-4o-mini reliably hallucinates ABA-valid routing numbers.
@@ -389,11 +415,17 @@ async def _process_check_chunk(
             # 2. Tesseract failed — try Smart AI Crop Fallback
             smart_ai_routing = await extract_micr_via_smart_ai_crop(check_bytes, known_check_number=kn_check)
             
+            # Rate limit guard: if we just did a fallback AI call, add a small jitter before the next check.
+            # This prevents 10 sequential fallback calls from hitting the 15 RPM limit too quickly.
+            import random
+            await asyncio.sleep(random.uniform(1.0, 2.0))
+            
             if smart_ai_routing and is_valid_routing(smart_ai_routing):
                 logger.info(f"Smart AI Crop OVERRIDE for {filename}: '{routing_raw}' → '{smart_ai_routing}'")
                 extracted_data['routing_number'] = smart_ai_routing
                 extracted_data['routing_repair_method'] = 'smart_ai_crop'
                 status_str, notes = validate_extracted_check_data(extracted_data)
+
             else:
                 # 3. Both failed — fall back to original AI's number or Math repair
                 if not is_valid_routing(routing_raw):
@@ -474,14 +506,10 @@ async def _process_batch_in_background(
     CHUNK_SIZE = 5
     chunks = [check_images[i:i + CHUNK_SIZE] for i in range(0, len(check_images), CHUNK_SIZE)]
     
-    # We only process 2 chunks concurrently (up to 10 images total globally in flight) 
-    # to keep memory low. OpenAI allows decent throughput for vision limits.
-    semaphore = asyncio.Semaphore(2)
-    
     async def _sem_process_chunk(chunk, index: int):
-        await asyncio.sleep(index * 1.5) # Stagger starts to distribute load over time
-        
-        async with semaphore:
+        # Using the GLOBAL gemini_lock to ensure all uploads across the system
+        # wait in a single-file line for AI processing.
+        async with gemini_lock:
             max_db_retries = 2
             for db_attempt in range(max_db_retries):
                 try:
@@ -495,10 +523,38 @@ async def _process_batch_in_background(
                         logger.error(f"Fatal DB Error for chunk {index}: {str(db_err)}")
                         raise
 
-    logger.info(f"Background processing started for {len(check_images)} checks (grouped into {len(chunks)} chunks of <=5) on batch {batch_id}")
+    logger.info(f"Background processing started for {len(check_images)} checks (grouped into {len(chunks)} chunks of {CHUNK_SIZE}) on batch {batch_id}")
     
-    tasks = [_sem_process_chunk(c, i) for i, c in enumerate(chunks)]
-    await asyncio.gather(*tasks, return_exceptions=True)
+    # Process chunks sequentially to STRICTLY adhere to Gemini Free tier RPM limits.
+    # Parallel attempts (gather) were triggering bursts that hit 429s.
+    results = []
+    for i, c in enumerate(chunks):
+        try:
+            res = await _sem_process_chunk(c, i)
+            results.append(res)
+        except Exception as e:
+            logger.error(f"Chunk {i} failed: {e}")
+            results.append(e)
+        
+        # Mandatory cool-down between chunks.
+        # This keeps us well under the 15 RPM ceiling even if Smart AI fallbacks are triggered.
+        import random
+        wait_time = random.uniform(3, 6)
+        if i < len(chunks) - 1:
+            logger.info(f"Chunk {i+1}/{len(chunks)} complete. Cooling down for {wait_time:.1f}s...")
+            await asyncio.sleep(wait_time)
+
+
+    # Final status update
+    try:
+        with SessionLocal() as db:
+            batch = db.query(CheckBatch).filter(CheckBatch.id == batch_id).first()
+            if batch:
+                batch.status = CheckStatus.EXTRACTED
+                db.commit()
+                logger.info(f"Batch {batch_id} status updated to EXTRACTED")
+    except Exception as e:
+        logger.error(f"Failed to update batch status at end of processing: {e}")
 
     logger.info(f"Background processing complete for batch {batch_id}")
 

@@ -9,13 +9,39 @@ import pytesseract
 from PIL import Image
 from openai import AsyncOpenAI
 from typing import Dict, Any, Tuple, Optional, List
+import google.generativeai as genai
+import asyncio
+import numpy as np
+import cv2
 import fitz # PyMuPDF
 from .validators import is_valid_routing
 
 logger = logging.getLogger("quicktrack")
 
 if os.name == 'nt':
-    pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+    tess_path_list = [
+        r'C:\Program Files\Tesseract-OCR\tesseract.exe',
+        r'C:\PROGRA~1\Tesseract-OCR\tesseract.exe'
+    ]
+    for p in tess_path_list:
+        if os.path.exists(p):
+            pytesseract.pytesseract.tesseract_cmd = p
+            break
+
+def get_tessdata_prefix():
+    """
+    Returns the path containing the 'tessdata' folder.
+    Prioritizes project-local models in server/tessdata.
+    """
+    local_tessdata = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tessdata')
+    if os.path.exists(local_tessdata):
+        # TESSDATA_PREFIX should point to the folder CONTAINING 'tessdata'
+        return os.path.dirname(local_tessdata)
+    
+    # Fallback to standard installation folder if local fails
+    if os.name == 'nt':
+        return r'C:\PROGRA~1\Tesseract-OCR'
+    return '/usr/share/tesseract-ocr/4.00/tessdata' # Linux fallback
 
 def deskew_image(img_cv):
     """
@@ -73,8 +99,10 @@ def extract_micr_with_tesseract(image_bytes: bytes, known_check_number: Optional
         if abs(skew_angle) > 0.5:
              logger.info(f"Deskewing check image by {skew_angle:.2f} degrees.")
 
-        # Adjusted to 0.80 height to ensure full character height is captured
-        crop = img_cv[int(h * 0.80):, :]
+        # Tightened to 0.92 height to strictly focus on the MICR line.
+        # This completely avoids the 'Memo' line and 'Payee' line. 
+        # MICR is almost always in the bottom 6-8% of a business check.
+        crop = img_cv[int(h * 0.92):, :]
 
         # Step 3: Upscale. Try 2x.
         crop_2x = cv2.resize(crop, (crop.shape[1] * 2, crop.shape[0] * 2), interpolation=cv2.INTER_CUBIC)
@@ -86,16 +114,7 @@ def extract_micr_with_tesseract(image_bytes: bytes, known_check_number: Optional
         adaptive = cv2.adaptiveThreshold(enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
         binary_versions.extend([otsu, adaptive])
         
-        # TESSDATA_PREFIX on Windows often expects the path ABOVE the tessdata folder
-        tessdata_parent = 'C:/tessdata_micr'
-        tessdata_dir = 'C:/tessdata_micr/tessdata'
-        if not os.path.exists(tessdata_dir):
-             # Fallback to local project folder
-             tessdata_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tessdata')
-             tessdata_parent = os.path.dirname(tessdata_dir)
-
-        # Set TESSDATA_PREFIX to the exact folder containing the traineddata
-        os.environ['TESSDATA_PREFIX'] = tessdata_dir
+        os.environ['TESSDATA_PREFIX'] = get_tessdata_prefix()
 
         # Try multiple redundant models
         configs = ['-l micr --psm 13', '-l micr+eng --psm 7', '--psm 6 digits']
@@ -143,17 +162,7 @@ def extract_micr_full_line(image_bytes: bytes, known_check_number: Optional[str]
         # Sweeping Ratios: [Bottom 35% to Bottom 18%]
         sweep_ratios = [0.65, 0.72, 0.78, 0.82]
         
-        # Space-safe short paths for Windows Tesseract
-        tess_bin = r'C:\PROGRA~1\Tesseract-OCR\tesseract.exe'
-        tessdata_dir = r'C:\PROGRA~1\Tesseract-OCR\tessdata'
-        
-        if not os.path.exists(tess_bin):
-            # Fallback to standard path if no 8.3 shortnames
-            tess_bin = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-            tessdata_dir = r'C:\Program Files\Tesseract-OCR\tessdata'
-            
-        pytesseract.pytesseract.tesseract_cmd = tess_bin
-        os.environ['TESSDATA_PREFIX'] = tessdata_dir
+        os.environ['TESSDATA_PREFIX'] = get_tessdata_prefix()
 
         for clip in sweep_ratios:
             crop = img_cv[int(h * clip):, :]
@@ -276,15 +285,14 @@ async def extract_micr_via_smart_ai_crop(image_bytes: bytes, known_check_number:
         h, w = img.shape
         # Use 25% height (0.75 start) to capture the MICR line clearly
         micr_strip = img[int(h * 0.75):, :]
-        
         _, buffer = cv2.imencode('.jpg', micr_strip)
         base64_image = base64.b64encode(buffer).decode('utf-8')
         
-        prompt = (
-            "Look at the bottom MICR line. Extract the 9-digit routing number. "
-            "IMPORTANT: Do NOT misread the '⑆' (transit) symbol as a '1'. "
-            "The routing number is the block of 9 digits between the transit symbols."
-        )
+        if AI_PROVIDER == "gemini":
+            prompt = "You are a specialized MICR reader. Look at the bottom strip. Return ONLY the routing digits found between transit symbols ⑆."
+        else:
+            prompt = "Look at the bottom of this check. Extract ONLY the 9 routing number digits found between transit symbols ⑆. Return 9 digits only. IMPORTANT: Do NOT misread the '⑆' (transit) symbol as a '1'. The routing number is the block of 9 digits between the transit symbols."
+        
         if known_check_number:
             prompt += f" (Note: skip the check number {known_check_number})"
 
@@ -296,14 +304,41 @@ async def extract_micr_via_smart_ai_crop(image_bytes: bytes, known_check_number:
             ]}
         ]
         
-        client_to_use = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-        response = await client_to_use.chat.completions.create(
-            model="gpt-4o",
-            messages=messages,
-            temperature=0.0
-        )
-        
-        raw_res = response.choices[0].message.content.strip()
+        if AI_PROVIDER == "gemini" and gemini_key:
+            model = genai.GenerativeModel('gemini-flash-latest')
+            max_attempts = 3
+            for attempt in range(max_attempts):
+                try:
+                    response = await model.generate_content_async(
+                        [prompt, Image.open(io.BytesIO(buffer))],
+                        generation_config=genai.types.GenerationConfig(temperature=0.0)
+                    )
+                    raw_res = response.text.strip()
+                    break
+                except Exception as e:
+                    err_str = str(e)
+                    is_rate_limit = any(x in err_str for x in ["429", "ResourceExhausted", "QuotaExceeded", "quota"])
+                    if is_rate_limit and attempt < max_attempts - 1:
+                        # Exponential backoff: 10s, 20s...
+                        wait_time = 10 * (attempt + 1)
+                        logger.warning(f"Smart AI Gemini Rate Limit (429). Waiting {wait_time}s and retrying fallback...")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    
+                    if not is_rate_limit:
+                        logger.error(f"Smart AI Gemini failure (Non-RateLimit): {e}")
+                    
+                    raw_res = "null"
+                    break
+
+        else:
+            client_to_use = AsyncOpenAI(api_key=openai_key)
+            response = await client_to_use.chat.completions.create(
+                model="gpt-4o",
+                messages=messages,
+                temperature=0.0
+            )
+            raw_res = response.choices[0].message.content.strip()
         logger.info(f"Smart AI (gpt-4o) Raw response: {raw_res}")
         
         match = re.search(r'\d{9}', raw_res)
@@ -321,7 +356,7 @@ async def extract_micr_via_smart_ai_crop(image_bytes: bytes, known_check_number:
 async def extract_check_data_via_tesseract_fallback(image_bytes: bytes, filename: str) -> Dict[str, Any]:
     """
     Fallback extraction using pytesseract with fixed heuristics based on standard Lama Corporation checks.
-    Invoked automatically when OpenAI Quota is exceeded.
+    Invoked automatically when the primary AI Provider's Quota is exceeded.
     """
     try:
         import numpy as np
@@ -373,7 +408,7 @@ async def extract_check_data_via_tesseract_fallback(image_bytes: bytes, filename
             "account_number": None,
             "confidence_score": 0.40,  # Lower to ensure manual review priority
             "status": "MANUAL_REVIEW_REQUIRED", 
-            "validation_notes": "Extracted via Legacy Tesseract Fallback (OpenAI Quota Exceeded). Please review all fields."
+            "validation_notes": f"Extracted via Legacy Tesseract Fallback ({AI_PROVIDER.upper()} Quota Hit). Please review all fields."
         }
         
         # Date (Top right)
@@ -488,7 +523,7 @@ async def extract_check_data_via_tesseract_fallback(image_bytes: bytes, filename
 def is_likely_deposit_slip(image_bytes: bytes) -> bool:
     """
     Fast pre-screen using pytesseract keyword scan to detect deposit slips
-    BEFORE sending to the expensive OpenAI API.
+    BEFORE sending to the expensive AI API.
     Tries multiple rotations since many scanned deposit slips are captured sideways.
     """
     try:
@@ -520,32 +555,44 @@ def is_likely_deposit_slip(image_bytes: bytes) -> bool:
         logger.warning(f"Deposit slip pre-screen failed ({e}), continuing with AI.")
         return False
 
-# Create the client lazily so the server can boot even if the key is empty initially.
-# It will fail at inference time explicitly instead of at boot time.
-client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY", "dummy-key-for-local-boot"))
+# Create the clients lazily
+openai_key = os.getenv("OPENAI_API_KEY", "dummy-key-for-local-boot")
+client = AsyncOpenAI(api_key=openai_key)
+
+gemini_key = os.getenv("GEMINI_KEY", os.getenv("GEMINI_API_KEY", ""))
+if gemini_key:
+    genai.configure(api_key=gemini_key)
+
+AI_PROVIDER = os.getenv("AI_PROVIDER", "openai").lower()
+logger.info(f"--- ACTIVE AI PROVIDER: {AI_PROVIDER.upper()} ---")
+if AI_PROVIDER == "gemini" and not gemini_key:
+    logger.warning(f"Gemini key is missing from .env.local! System will fallback to OpenAI (if available) or Tesseract.")
 
 SYSTEM_PROMPT = """
 You are an expert Check OCR Assistant. Your sole job is to extract structured data from US business checks and filter out deposit slips.
 
-### DOCUMENT CLASSIFICATION (Critical - Do this first):
-- Check for words like "DEPOSIT TICKET", "DEPOSIT SLIP", "CURRENCY", "COIN", "TOTAL CASH", "LIST CHECKS SEPARATELY", "TOTAL ITEMS", or check if there is a vertical grid for counting cash and coins → classify as 'deposit_slip'.
-- If the image has a "Pay to the Order of" line, a written amount format (e.g. "One hundred dollars"), and a signature area → classify as 'check'.
-- deposit slips often have MICR lines too, DO NOT classify as 'check' just because there is an MICR line!
-- If unsure → classify as 'other'
+### DOCUMENT CLASSIFICATION (Critical):
+- Classify as 'deposit_slip' if you see: "DEPOSIT TICKET", "DEPOSIT SLIP", "CASHIER'S CHECK" (receipt), "CURRENCY", "TOTAL CASH".
+- Classify as 'check' ONLY if you see: "Pay to the Order of", a bank name, a signature line, and a single numerical amount box.
+- Classify as 'other' if the document is a BANK STATEMENT, SUMMARY TABLE, REMITTANCE ADVICE, or INVOICE. 
+- IMPORTANT: If you see a list of transactions, multiple dates/amounts in rows, or headers like "STATEMENT PERIOD", "TOTAL DEBITS", "ACCOUNT ACTIVITY", or "ITEMIZED LISTING" -> classify as 'other'.
+- CRITICAL: Prosperity Bank and City of Clarksville summary tables listing multiple checks must be classified as 'other'. We ONLY want the actual single check images.
+- If unsure -> classify as 'other'
 
 ### EXTRACTION RULES (Only for 'check' documents):
 1. STORE NAME: The full name from the top-left header. Include ALL suffixes shown (e.g., 'Lama Corporation Operating 18', 'Quick Track Inc DBA Quick Track #108').
-2. CHECK NUMBER: The number in the top-right corner of the check body, or the number in the MICR line.
+2. CHECK NUMBER: Look at the top-right corner. It is usually 4-6 digits.
 3. DATE: The date printed on the check. Format as YYYY-MM-DD.
 4. PAYEE NAME: The name printed after "Pay to the Order of".
-5. AMOUNT: The numerical dollar amount (as a float, e.g. 1370.18).
+5. AMOUNT: The numerical dollar amount. Look specifically for the box on the right side. It usually has two asterisks like **$110.96**. Return as a float (e.g. 110.96).
 6. BANK NAME: The bank printed on the check (e.g., 'Prosperity Bank').
 7. MEMO: The text on the memo line if present.
 
 ### MICR LINE INSTRUCTIONS (Critical for routing/account accuracy):
 The MICR line at the very bottom of a check contains numbers separated by special transit symbols (⑆) and On-Us symbols (⑈).
-- ROUTING NUMBER: ONLY extract the 9 digits if you see them clearly at the very bottom of the check between transit symbols (⑆). DO NOT guess, DO NOT calculate check digits, and DO NOT extract from the Memo or Invoice lines. If the MICR line is blurry or unreadable, return null. The routing number NEVER starts with "INV" or letters.
-- ACCOUNT NUMBER: The block of digits usually adjacent to the routing number at the bottom.
+- ROUTING NUMBER: ONLY extract the 9 digits found at the very bottom between the transit symbols (⑆). For example: ⑆123456789⑆.
+- ACCOUNT NUMBER: The block of digits that follows the second transit symbol (⑆) and usually ends with an On-Us symbol (⑈). Extract ONLY the digits. 
+- IMPORTANT: On some formats (e.g., Prosperity Bank), the check number appears twice in the MICR line. DO NOT include the check number in the account number.
 - NEVER confuse the check number or invoice number with the routing number.
 
 Return ONLY raw JSON:
@@ -564,30 +611,145 @@ Return ONLY raw JSON:
 }
 """
 
+async def extract_check_batch_via_gemini(checks: list[Tuple[bytes, str]], table_data: Optional[Dict[str, Tuple[str, float]]] = None) -> List[Dict[str, Any]]:
+    """
+    Extracts data using Gemini 2.0 Flash vision model.
+    Optimized to be non-blocking for dashboard responsiveness.
+    """
+    try:
+        # Use gemini-flash-latest for best free tier stability
+        model = genai.GenerativeModel('gemini-flash-latest')
+        
+        # Prepare the request
+        contents = [BATCH_SYSTEM_PROMPT]
+        
+        async def process_image(file_bytes: bytes, filename: str, idx: int):
+            def _sync_process():
+                # Handle PDF to Image conversion
+                if filename.lower().endswith(".pdf"):
+                    pdf_document = fitz.open(stream=file_bytes, filetype="pdf")
+                    if pdf_document.page_count > 0:
+                        page = pdf_document[0]
+                        # 1.5x zoom is a good balance for tokens vs accuracy
+                        pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
+                        target_bytes = pix.tobytes("jpeg")
+                    else:
+                        target_bytes = file_bytes
+                    pdf_document.close()
+                else:
+                    target_bytes = file_bytes
+                    
+                raw_img = Image.open(io.BytesIO(target_bytes))
+                # Auto-resize to stay under token limits (2000px max)
+                if raw_img.width > 2000 or raw_img.height > 2000:
+                    raw_img.thumbnail((2000, 2000))
+                    
+                # Convert to OpenCV for high-quality contrast enhancement
+                img_cv = cv2.cvtColor(np.array(raw_img), cv2.COLOR_RGB2BGR)
+                
+                # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
+                # This makes faint handwriting and text pop out against check backgrounds.
+                lab = cv2.cvtColor(img_cv, cv2.COLOR_BGR2LAB)
+                l, a, b_chan = cv2.split(lab)
+                clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+                cl = clahe.apply(l)
+                limg = cv2.merge((cl,a,b_chan))
+                enhanced = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
+                
+                # Convert back to PIL for Gemini
+                final_img = Image.fromarray(cv2.cvtColor(enhanced, cv2.COLOR_BGR2RGB))
+                return final_img
+
+            # Offload blocking PIL/Fitz operations to a separate thread
+            return await asyncio.to_thread(_sync_process)
+
+        for idx, (fb, fn) in enumerate(checks, start=1):
+            contents.append(f"IMAGE {idx} of {len(checks)} (Filename: {fn}):")
+            img_obj = await process_image(fb, fn, idx)
+            contents.append(img_obj)
+
+        # Generate content with robust Adaptive Backoff & Jitter
+        max_attempts = 5
+        for attempt in range(max_attempts):
+            try:
+                response = await model.generate_content_async(
+                    contents,
+                    generation_config=genai.types.GenerationConfig(
+                        temperature=0.0,
+                        response_mime_type="application/json",
+                    )
+                )
+                raw_text = response.text
+                break # Success!
+            except Exception as e:
+                import random
+                err_msg = str(e)
+                is_rate_limit = any(x in err_msg for x in ["429", "ResourceExhausted", "QuotaExceeded", "quota"])
+                
+                if is_rate_limit:
+                    if "quota" in err_msg.lower() or "limit" in err_msg.lower():
+                        # Hard Quota limit hit (e.g. 20/day) — waiting is futile
+                        logger.error(f"Gemini HARD QUOTA hit. Failing over to Tesseract immediately.")
+                        raise e
+                    
+                    if attempt < max_attempts - 1:
+                        # Transient Rate Limit: Adaptive Wait
+                        base_wait = min(120, 30 * (2 ** attempt))
+                        jitter = random.uniform(5, 15)
+                        wait_time = base_wait + jitter
+                        
+                        logger.warning(f"Gemini RPM Limit hit. Waiting {wait_time:.1f}s and retrying (Attempt {attempt+1}/{max_attempts})...")
+                        await asyncio.sleep(wait_time)
+                        continue
+                raise e
+        
+        data = json.loads(raw_text)
+        results = data.get("results", [])
+        
+        # Padding
+        while len(results) < len(checks):
+            results.append({"status": "GEMINI_OMITTED_FROM_ARRAY"})
+            
+        return results[:len(checks)]
+        
+    except Exception as e:
+        logger.error(f"Gemini batch extraction failed after all retries ({type(e).__name__}): {e}")
+        # Restore safety net: Fallback to high-precision Tesseract if AI is truly exhausted.
+        # This ensures the user gets Check #s and Dates instead of a blank screen.
+        fallback_results = []
+        for b, f in checks:
+            res = await extract_check_data_via_tesseract_fallback(b, f)
+            # Tag the result with the reason for transparency in the dashboard
+            reason = str(e) if "429" in str(e) else f"{AI_PROVIDER.upper()} Unavailable"
+            res["status_warning"] = f"Fallback: {reason}"
+            fallback_results.append(res)
+        return fallback_results
+
 BATCH_SYSTEM_PROMPT = """
 You are an expert Check OCR Assistant. Your sole job is to extract structured data from US business checks and filter out deposit slips.
 You will be provided with MULTIPLE check images, each labeled with an index (e.g. "IMAGE 1 of N", "IMAGE 2 of N", etc.). You MUST return a JSON object with a single key "results" containing an array with EXACTLY one extraction object per image, in the EXACT same order as the images. Do NOT skip any image. Do NOT merge images. Array index 0 = IMAGE 1, index 1 = IMAGE 2, etc.
 
-### DOCUMENT CLASSIFICATION (Critical - Do this first):
-- Check for words like "DEPOSIT TICKET", "DEPOSIT SLIP", "CURRENCY", "COIN", "TOTAL CASH", "LIST CHECKS SEPARATELY", "TOTAL ITEMS", or check if there is a vertical grid for counting cash and coins → classify as 'deposit_slip'.
-- If the image has a "Pay to the Order of" line, a written amount format (e.g. "One hundred dollars"), and a signature area → classify as 'check'.
-- deposit slips often have MICR lines too, DO NOT classify as 'check' just because there is an MICR line!
-- If unsure → classify as 'other'
+### DOCUMENT CLASSIFICATION (Critical):
+- Classify as 'deposit_slip' if you see: "DEPOSIT TICKET", "DEPOSIT SLIP", "CASHIER'S CHECK" (receipt), "CURRENCY", "TOTAL CASH".
+- Classify as 'check' ONLY if you see: "Pay to the Order of", a bank name, a signature line, and a single numerical amount box.
+- Classify as 'other' if the document is a BANK STATEMENT, SUMMARY TABLE, REMITTANCE ADVICE, or INVOICE.
+- IMPORTANT: If you see a list of transactions, multiple dates/amounts in rows, or headers like "STATEMENT PERIOD", "TOTAL DEBITS", "ACCOUNT ACTIVITY", or "ITEMIZED LISTING" -> classify as 'other'.
+- CRITICAL: Prosperity Bank and City of Clarksville summary tables listing multiple checks must be classified as 'other'. We ONLY want the actual single check images.
+- If unsure -> classify as 'other'
 
 ### EXTRACTION RULES (Only for 'check' documents):
 1. STORE NAME: The full name from the top-left header. Include ALL suffixes shown.
-2. CHECK NUMBER: The number in the top-right corner of the check body, or the number in the MICR line.
+2. CHECK NUMBER: Look at the top-right corner. It is usually 4-6 digits.
 3. DATE: The date printed on the check. Format as YYYY-MM-DD.
 4. PAYEE NAME: The name printed after "Pay to the Order of".
-5. AMOUNT: The numerical dollar amount (as a float, e.g. 1370.18).
+5. AMOUNT: The numerical dollar amount. Look specifically for the box on the right side. It usually has two asterisks like **$110.96**. Return as a float (e.g. 110.96).
 6. BANK NAME: The bank printed on the check.
 7. MEMO: The text on the memo line if present.
 
 ### MICR LINE INSTRUCTIONS (Critical for routing/account accuracy):
-The MICR line at the very bottom of a check contains numbers separated by special transit symbols (⑆) and On-Us symbols (⑈).
-- ROUTING NUMBER: ONLY extract the 9 digits if you see them clearly at the very bottom of the check between transit symbols (⑆). DO NOT guess, DO NOT calculate check digits, and DO NOT extract from the Memo or Invoice lines. If the MICR line is blurry or unreadable, return null. The routing number NEVER starts with "INV" or letters.
-- ACCOUNT NUMBER: The block of digits usually adjacent to the routing number at the bottom.
-- IMPORTANT: On some check formats (e.g. Prosperity Bank), the check number is printed TWICE in the MICR line: once at the very start and once at the end. DO NOT include the check number as part of the account number.
+- ROUTING NUMBER: ONLY extract the 9 digits found at the very bottom between the transit symbols (⑆). For example: ⑆123456789⑆.
+- ACCOUNT NUMBER: The block of digits that follows the second transit symbol (⑆) and usually ends with an On-Us symbol (⑈). Extract ONLY the digits.
+- IMPORTANT: On some formats (e.g., Prosperity Bank), the check number appears twice in the MICR line. DO NOT include the check number in the account number.
 - NEVER confuse the check number or invoice number with the routing number.
 
 Return ONLY raw JSON in this format:
@@ -612,12 +774,13 @@ Return ONLY raw JSON in this format:
 
 async def extract_check_batch_via_ai(checks: list[Tuple[bytes, str]], table_data: Optional[Dict[str, Tuple[str, float]]] = None) -> List[Dict[str, Any]]:
     """
-    Takes a LIST of (file_bytes, filename) tuples and passes them all in ONE API call to GPT-4o-mini.
-    Returns a list of extracted dictionaries directly aligned with the input list.
-    Saves massive amounts of prompt tokens.
+    Takes a LIST of (file_bytes, filename) tuples and passes them all in ONE API call.
     """
     if not checks:
         return []
+
+    if AI_PROVIDER == "gemini" and gemini_key:
+        return await extract_check_batch_via_gemini(checks, table_data)
 
     key = os.getenv("OPENAI_API_KEY", "")
     is_placeholder = not key or key in [
@@ -682,6 +845,9 @@ async def extract_check_batch_via_ai(checks: list[Tuple[bytes, str]], table_data
 
     for attempt in range(max_retries):
         try:
+            if AI_PROVIDER == "gemini" and gemini_key:
+                return await extract_check_batch_via_gemini(checks, table_data)
+            
             response = await client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=messages,
@@ -692,22 +858,22 @@ async def extract_check_batch_via_ai(checks: list[Tuple[bytes, str]], table_data
         except Exception as e:
             error_str = str(e).lower()
             if "insufficient_quota" in error_str:
-                logger.error(f"OpenAI Quota Exceeded. Triggering Local Tesseract OCR fallback for batch.")
+                logger.error(f"{AI_PROVIDER.upper()} Quota Exceeded. Triggering Local Tesseract OCR fallback for batch.")
                 fallback_results = []
                 for b, f in checks:
                     res = await extract_check_data_via_tesseract_fallback(b, f)
                     fallback_results.append(res)
                 return fallback_results
             elif "429" in str(e) and attempt < max_retries - 1:
-                logger.warning(f"Batch OpenAI Rate Limit hit, retrying in {retry_delay}s...")
+                logger.warning(f"Batch {AI_PROVIDER.upper()} Rate Limit hit, retrying in {retry_delay}s...")
                 await asyncio.sleep(retry_delay)
                 retry_delay *= 2
+                continue
             else:
-                logger.error(f"Batch OpenAI Request failed: {e}")
-                raise
-
-    if not response:
-        raise RuntimeError("OpenAI failed to return a batch response.")
+                logger.error(f"Batch {AI_PROVIDER.upper()} Request failed: {e}")
+                break
+        
+    raise RuntimeError(f"{AI_PROVIDER.upper()} failed to return a batch response.")
 
     content = response.choices[0].message.content
     try:
@@ -830,6 +996,11 @@ async def extract_check_data_via_ai(file_bytes: bytes, filename: str, table_data
 
     for attempt in range(max_retries):
         try:
+            if AI_PROVIDER == "gemini" and gemini_key:
+                # Reuse the optimized batch logic even for single checks to maintain consistency
+                result_batch = await extract_check_batch_via_gemini([(file_bytes, filename)], table_data)
+                return result_batch[0] if result_batch else {"status": "GEMINI_FAILED"}
+
             response = await client.chat.completions.create(
                 model=model_name,
                 messages=[
@@ -859,21 +1030,21 @@ async def extract_check_data_via_ai(file_bytes: bytes, filename: str, table_data
             break # Success
         except Exception as e:
             error_str = str(e).lower()
+            import traceback
+            error_trace = traceback.format_exc()
             if "insufficient_quota" in error_str:
-                logger.error(f"OpenAI Quota Exceeded for {filename}. Aborting.")
+                logger.error(f"{AI_PROVIDER.upper()} Quota Exceeded for {filename}. Aborting.")
                 raise RuntimeError("QUOTA_EXCEEDED")
             elif "429" in str(e) and attempt < max_retries - 1:
-                logger.warning(f"OpenAI Rate Limit hit for {filename}, retrying in {retry_delay}s... (Attempt {attempt+1}/{max_retries})")
+                logger.warning(f"{AI_PROVIDER.upper()} Rate Limit hit for {filename}, retrying in {retry_delay}s... (Attempt {attempt+1}/{max_retries})")
                 await asyncio.sleep(retry_delay)
                 retry_delay *= 2 # Exponential backoff
+                continue
             else:
-                import traceback
-                error_trace = traceback.format_exc()
-                logger.error(f"OpenAI Request failed for {filename}: {str(e)}\n{error_trace}")
-                raise
-
-    if not response:
-        raise RuntimeError(f"OpenAI failed to return a response for {filename} after {max_retries} attempts.")
+                logger.error(f"{AI_PROVIDER.upper()} Request failed for {filename}: {str(e)}\n{error_trace}")
+                break
+                
+    raise RuntimeError(f"{AI_PROVIDER.upper()} failed to return a response for {filename} after {max_retries} attempts.")
 
     content = response.choices[0].message.content
     logger.info(f"RAW AI RESPONSE for {filename}: {content}") # CRITICAL LOG FOR DEBUGGING
