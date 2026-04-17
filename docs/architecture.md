@@ -32,7 +32,7 @@ Located in `server/`. Follows a modular monolithic design.
 - **`main.py`**: The application entry point defining all API endpoints (Auth, Upload, Extraction, Batch Mgmt, Export).
 - **`models.py`**: SQLAlchemy ORM definitions linking Python objects to PostgreSQL tables (`User`, `CheckBatch`, `Check`, `AuditLog`).
 - **`database.py`**: Initializes the SQL connection pool and session dependency.
-- **`ai_extractor.py`**: Orchestrates OpenAI API interactions. Contains strictly tuned system prompts tailored for MICR code and standard check layout extraction.
+- **`ai_extractor.py`**: Orchestrates Google Gemini (Flash) API interactions. Contains strictly tuned system prompts tailored for MICR code and standard check layout extraction. Includes a rate-limiting queue for the Gemini Free Tier.
 - **`pdf_extractor.py` & `table_extractor.py`**: Wraps PyMuPDF to cleanly convert varied document formats (PDF) into standardized, high-DPI image base64 strings needed for the Vision AI.
 - **`validators.py`**: Extremely critical component ensuring AI hallucinated routing/account numbers are identified. Validates inputs using banking standard checksum algorithms (e.g., ABA routing checksums).
 - **`security.py`**: Handles bcrypt password hashing, and JWT minting and verification.
@@ -43,9 +43,9 @@ Located in `server/`. Follows a modular monolithic design.
 
 1. **Upload Initiation**: User drops a PDF or batch of Images on the UI. The Next.js frontend calls `POST /api/checks/upload` on the backend, generating a tracking `CheckBatch` in the DB.
 2. **File Processing**: The FastAPI backend asynchronously processes the uploaded files. PyMuPDF extracts/renders pages at high resolution.
-3. **AI Vision Request**: The `ai_extractor.py` converts each high-res page image to Base64 and executes a synchronous request to the OpenAI `gpt-4o-mini` API endpoint.
+3. **AI Vision Request**: The `ai_extractor.py` converts each high-res page image to Base64 and executes a sequential request to the Google Gemini 1.5 API.
 4. **Validation Layer**:
-    - The JSON returned from OpenAI is parsed.
+    - The JSON returned from Gemini is parsed.
     - `validators.py` kicks in. It sanitizes text, fixes common OCR confusions (e.g., distinguishing the letter 'O' vs the number '0'), and runs an ABA routing checksum.
     - If the MICR line fails validation, the check's `status` defaults to `needs_review` rather than `approved`.
 5. **Storage**: The original check images are stored in AWS S3 (retrieved later via presigned URLs). The validated extracted data is written to the PostgreSQL database under the associated batch ID.

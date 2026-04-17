@@ -556,17 +556,23 @@ def is_likely_deposit_slip(image_bytes: bytes) -> bool:
         return False
 
 # Create the clients lazily
-openai_key = os.getenv("OPENAI_API_KEY", "dummy-key-for-local-boot")
-client = AsyncOpenAI(api_key=openai_key)
+openai_key = os.getenv("OPENAI_API_KEY", "")
+client = None
+if openai_key and openai_key not in ["sk-your-key-here", "dummy-key-for-local-boot"]:
+    client = AsyncOpenAI(api_key=openai_key)
 
 gemini_key = os.getenv("GEMINI_KEY", os.getenv("GEMINI_API_KEY", ""))
 if gemini_key:
     genai.configure(api_key=gemini_key)
 
-AI_PROVIDER = os.getenv("AI_PROVIDER", "openai").lower()
+AI_PROVIDER = os.getenv("AI_PROVIDER", "gemini").lower()
 logger.info(f"--- ACTIVE AI PROVIDER: {AI_PROVIDER.upper()} ---")
+
 if AI_PROVIDER == "gemini" and not gemini_key:
-    logger.warning(f"Gemini key is missing from .env.local! System will fallback to OpenAI (if available) or Tesseract.")
+    logger.error("!!! CRITICAL: AI_PROVIDER is set to GEMINI but GEMINI_API_KEY is missing !!!")
+elif AI_PROVIDER == "openai" and not client:
+    logger.error("!!! CRITICAL: AI_PROVIDER is set to OPENAI but OPENAI_API_KEY is missing !!!")
+
 
 SYSTEM_PROMPT = """
 You are an expert Check OCR Assistant. Your sole job is to extract structured data from US business checks and filter out deposit slips.
@@ -942,10 +948,15 @@ async def extract_check_batch_via_ai(checks: list[Tuple[bytes, str]], table_data
 
 async def extract_check_data_via_ai(file_bytes: bytes, filename: str, table_data: Optional[Dict[str, Tuple[str, float]]] = None) -> Dict[str, Any]:
     """
-    Handles PDF to JPG conversion if necessary, then passes to GPT-4o-mini API
-    Returns dict directly aligned with PRD 3 requirements
-    Cross-validates with an optional table_data (CheckNum -> (Date, Amount)).
+    Unified extraction entry point for single checks. 
+    Respects AI_PROVIDER setting (Gemini preferred).
     """
+    if AI_PROVIDER == "gemini" and gemini_key:
+        results = await extract_check_batch_via_gemini([(file_bytes, filename)], table_data)
+        if results:
+            return results[0]
+        return {}
+
     key = os.getenv("OPENAI_API_KEY", "")
     is_placeholder = not key or key in [
         "", "sk-your-key-here", "dummy-key-for-local-boot",
@@ -955,7 +966,7 @@ async def extract_check_data_via_ai(file_bytes: bytes, filename: str, table_data
     if is_placeholder:
         # MOCK DATA RETURN for testing without credentials
         return {
-            "store_name": "Quick Track Store 1", # Perfect fuzzy match for testing
+            "store_name": "Quick Track Store 1",
             "check_number": "1190005",
             "check_date": "2026-02-16",
             "payee_name": "Aryan Poudel",
@@ -964,43 +975,29 @@ async def extract_check_data_via_ai(file_bytes: bytes, filename: str, table_data
             "bank_name": "Stellar Bank",
             "routing_number": "113025723",
             "account_number": "2017237191",
-            "confidence_score": 0.98  # High confidence to test Auto-Approve
+            "confidence_score": 0.98
         }
 
-    # 1. Provide PDF Support per PRD 3
+    # Standard OpenAI Logic
     if filename.lower().endswith(".pdf"):
-        # Convert first page of PDF to image bytes using PyMuPDF (no poppler needed)
         pdf_document = fitz.open(stream=file_bytes, filetype="pdf")
         if pdf_document.page_count == 0:
             raise ValueError("Empty PDF document")
-            
         page = pdf_document[0]
-        # Generate pixmap (image) from page
-        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2)) # 2x zoom for better OCR
+        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
         target_bytes = pix.tobytes("jpeg")
         pdf_document.close()
     else:
-        # Standard JPG/PNG upload
         target_bytes = file_bytes
         
     base64_image = base64.b64encode(target_bytes).decode('utf-8')
     model_name = "gpt-4o-mini"
-
-    key_prefix = key[:10] if key else "MISSING"
-    logger.info(f"AI START: {filename} (Key: {key_prefix}..., Base64 len: {len(base64_image)})")
-
-    import asyncio
     max_retries = 3
     retry_delay = 5
     response = None
 
     for attempt in range(max_retries):
         try:
-            if AI_PROVIDER == "gemini" and gemini_key:
-                # Reuse the optimized batch logic even for single checks to maintain consistency
-                result_batch = await extract_check_batch_via_gemini([(file_bytes, filename)], table_data)
-                return result_batch[0] if result_batch else {"status": "GEMINI_FAILED"}
-
             response = await client.chat.completions.create(
                 model=model_name,
                 messages=[

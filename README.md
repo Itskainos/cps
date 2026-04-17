@@ -34,7 +34,7 @@ Detailed documentation has been separated into their designated domains:
 ### Backend
 - Python 3.9+, FastAPI
 - SQLAlchemy (PostgreSQL)
-- OpenAI API (Vision), PyMuPDF (fitz)
+- Google Gemini 1.5 API (Vision), PyMuPDF (fitz)
 - AWS S3
 
 ---
@@ -66,7 +66,8 @@ npm run dev
 Create your `.env.local` file at the root:
 ```env
 DATABASE_URL=postgresql://user:password@localhost/dbname
-OPENAI_API_KEY=sk-your-openai-api-key
+AI_PROVIDER=gemini
+GEMINI_API_KEY=your-gemini-api-key
 AWS_ACCESS_KEY_ID=your-access-key
 AWS_SECRET_ACCESS_KEY=your-secret-key
 AWS_REGION=us-east-1
